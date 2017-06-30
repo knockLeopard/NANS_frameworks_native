@@ -18,21 +18,13 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <diskusage/dirsize.h>
 
 int64_t stat_size(struct stat *s)
 {
-    int64_t blksize = s->st_blksize;
-    // count actual blocks used instead of nominal file size
-    int64_t size = s->st_blocks * 512;
-
-    if (blksize) {
-        /* round up to filesystem block size */
-        size = (size + blksize - 1) & (~(blksize - 1));
-    }
-
-    return size;
+    return s->st_blocks * 512;
 }
 
 int64_t calculate_dir_size(int dfd)
@@ -50,9 +42,6 @@ int64_t calculate_dir_size(int dfd)
 
     while ((de = readdir(d))) {
         const char *name = de->d_name;
-        if (fstatat(dfd, name, &s, AT_SYMLINK_NOFOLLOW) == 0) {
-            size += stat_size(&s);
-        }
         if (de->d_type == DT_DIR) {
             int subfd;
 
@@ -64,9 +53,16 @@ int64_t calculate_dir_size(int dfd)
                     continue;
             }
 
+            if (fstatat(dfd, name, &s, AT_SYMLINK_NOFOLLOW) == 0) {
+                size += stat_size(&s);
+            }
             subfd = openat(dfd, name, O_RDONLY | O_DIRECTORY);
             if (subfd >= 0) {
                 size += calculate_dir_size(subfd);
+            }
+        } else {
+            if (fstatat(dfd, name, &s, AT_SYMLINK_NOFOLLOW) == 0) {
+                size += stat_size(&s);
             }
         }
     }

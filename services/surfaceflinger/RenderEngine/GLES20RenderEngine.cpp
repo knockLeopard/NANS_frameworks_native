@@ -48,12 +48,6 @@ GLES20RenderEngine::GLES20RenderEngine() :
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
 
-    struct pack565 {
-        inline uint16_t operator() (int r, int g, int b) const {
-            return (r<<11)|(g<<5)|b;
-        }
-    } pack565;
-
     const uint16_t protTexData[] = { 0 };
     glGenTextures(1, &mProtectedTexName);
     glBindTexture(GL_TEXTURE_2D, mProtectedTexName);
@@ -123,14 +117,25 @@ void GLES20RenderEngine::setViewportAndProjection(
     mVpHeight = vph;
 }
 
+#ifdef USE_HWC2
+void GLES20RenderEngine::setupLayerBlending(bool premultipliedAlpha,
+        bool opaque, float alpha) {
+#else
 void GLES20RenderEngine::setupLayerBlending(
     bool premultipliedAlpha, bool opaque, int alpha) {
+#endif
 
     mState.setPremultipliedAlpha(premultipliedAlpha);
     mState.setOpaque(opaque);
+#ifdef USE_HWC2
+    mState.setPlaneAlpha(alpha);
+
+    if (alpha < 1.0f || !opaque) {
+#else
     mState.setPlaneAlpha(alpha / 255.0f);
 
     if (alpha < 0xFF || !opaque) {
+#endif
         glEnable(GL_BLEND);
         glBlendFunc(premultipliedAlpha ? GL_ONE : GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     } else {
@@ -138,14 +143,26 @@ void GLES20RenderEngine::setupLayerBlending(
     }
 }
 
+#ifdef USE_HWC2
+void GLES20RenderEngine::setupDimLayerBlending(float alpha) {
+#else
 void GLES20RenderEngine::setupDimLayerBlending(int alpha) {
+#endif
     mState.setPlaneAlpha(1.0f);
     mState.setPremultipliedAlpha(true);
     mState.setOpaque(false);
+#ifdef USE_HWC2
+    mState.setColor(0, 0, 0, alpha);
+#else
     mState.setColor(0, 0, 0, alpha/255.0f);
+#endif
     mState.disableTexture();
 
+#ifdef USE_HWC2
+    if (alpha == 1.0f) {
+#else
     if (alpha == 0xFF) {
+#endif
         glDisable(GL_BLEND);
     } else {
         glEnable(GL_BLEND);
@@ -173,6 +190,12 @@ void GLES20RenderEngine::setupLayerBlackedOut() {
     Texture texture(Texture::TEXTURE_2D, mProtectedTexName);
     texture.setDimensions(1, 1); // FIXME: we should get that from somewhere
     mState.setTexture(texture);
+}
+
+mat4 GLES20RenderEngine::setupColorTransform(const mat4& colorTransform) {
+    mat4 oldTransform = mState.getColorMatrix();
+    mState.setColorMatrix(colorTransform);
+    return oldTransform;
 }
 
 void GLES20RenderEngine::disableTexturing() {
@@ -241,78 +264,6 @@ void GLES20RenderEngine::drawMesh(const Mesh& mesh) {
     if (mesh.getTexCoordsSize()) {
         glDisableVertexAttribArray(Program::texCoords);
     }
-}
-
-void GLES20RenderEngine::beginGroup(const mat4& colorTransform) {
-
-    GLuint tname, name;
-    // create the texture
-    glGenTextures(1, &tname);
-    glBindTexture(GL_TEXTURE_2D, tname);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, mVpWidth, mVpHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-
-    // create a Framebuffer Object to render into
-    glGenFramebuffers(1, &name);
-    glBindFramebuffer(GL_FRAMEBUFFER, name);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tname, 0);
-
-    Group group;
-    group.texture = tname;
-    group.fbo = name;
-    group.width = mVpWidth;
-    group.height = mVpHeight;
-    group.colorTransform = colorTransform;
-
-    mGroupStack.push(group);
-}
-
-void GLES20RenderEngine::endGroup() {
-
-    const Group group(mGroupStack.top());
-    mGroupStack.pop();
-
-    // activate the previous render target
-    GLuint fbo = 0;
-    if (!mGroupStack.isEmpty()) {
-        fbo = mGroupStack.top().fbo;
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-
-    // set our state
-    Texture texture(Texture::TEXTURE_2D, group.texture);
-    texture.setDimensions(group.width, group.height);
-    glBindTexture(GL_TEXTURE_2D, group.texture);
-
-    mState.setPlaneAlpha(1.0f);
-    mState.setPremultipliedAlpha(true);
-    mState.setOpaque(false);
-    mState.setTexture(texture);
-    mState.setColorMatrix(group.colorTransform);
-    glDisable(GL_BLEND);
-
-    Mesh mesh(Mesh::TRIANGLE_FAN, 4, 2, 2);
-    Mesh::VertexArray<vec2> position(mesh.getPositionArray<vec2>());
-    Mesh::VertexArray<vec2> texCoord(mesh.getTexCoordArray<vec2>());
-    position[0] = vec2(0, 0);
-    position[1] = vec2(group.width, 0);
-    position[2] = vec2(group.width, group.height);
-    position[3] = vec2(0, group.height);
-    texCoord[0] = vec2(0, 0);
-    texCoord[1] = vec2(1, 0);
-    texCoord[2] = vec2(1, 1);
-    texCoord[3] = vec2(0, 1);
-    drawMesh(mesh);
-
-    // reset color matrix
-    mState.setColorMatrix(mat4());
-
-    // free our fbo and texture
-    glDeleteFramebuffers(1, &group.fbo);
-    glDeleteTextures(1, &group.texture);
 }
 
 void GLES20RenderEngine::dump(String8& result) {

@@ -20,6 +20,7 @@
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 //#define LOG_NDEBUG 0
 
+#include <gui/BufferItem.h>
 #include <gui/IGraphicBufferConsumer.h>
 #include <gui/IGraphicBufferProducer.h>
 #include <gui/StreamSplitter.h>
@@ -80,7 +81,7 @@ status_t StreamSplitter::addOutput(
 
     IGraphicBufferProducer::QueueBufferOutput queueBufferOutput;
     sp<OutputListener> listener(new OutputListener(this, outputQueue));
-    outputQueue->asBinder()->linkToDeath(listener);
+    IInterface::asBinder(outputQueue)->linkToDeath(listener);
     status_t status = outputQueue->connect(listener, NATIVE_WINDOW_API_CPU,
             /* producerControlledByApp */ false, &queueBufferOutput);
     if (status != NO_ERROR) {
@@ -123,7 +124,7 @@ void StreamSplitter::onFrameAvailable(const BufferItem& /* item */) {
     ++mOutstandingBuffers;
 
     // Acquire and detach the buffer from the input
-    IGraphicBufferConsumer::BufferItem bufferItem;
+    BufferItem bufferItem;
     status_t status = mInput->acquireBuffer(&bufferItem, /* presentWhen */ 0);
     LOG_ALWAYS_FATAL_IF(status != NO_ERROR,
             "acquiring buffer from input failed (%d)", status);
@@ -131,7 +132,7 @@ void StreamSplitter::onFrameAvailable(const BufferItem& /* item */) {
     ALOGV("acquired buffer %#" PRIx64 " from input",
             bufferItem.mGraphicBuffer->getId());
 
-    status = mInput->detachBuffer(bufferItem.mBuf);
+    status = mInput->detachBuffer(bufferItem.mSlot);
     LOG_ALWAYS_FATAL_IF(status != NO_ERROR,
             "detaching buffer from input failed (%d)", status);
 
@@ -141,9 +142,9 @@ void StreamSplitter::onFrameAvailable(const BufferItem& /* item */) {
 
     IGraphicBufferProducer::QueueBufferInput queueInput(
             bufferItem.mTimestamp, bufferItem.mIsAutoTimestamp,
-            bufferItem.mCrop, bufferItem.mScalingMode,
-            bufferItem.mTransform, bufferItem.mIsDroppable,
-            bufferItem.mFence);
+            bufferItem.mDataSpace, bufferItem.mCrop,
+            static_cast<int32_t>(bufferItem.mScalingMode),
+            bufferItem.mTransform, bufferItem.mFence);
 
     // Attach and queue the buffer to each of the outputs
     Vector<sp<IGraphicBufferProducer> >::iterator output = mOutputs.begin();

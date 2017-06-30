@@ -18,10 +18,13 @@
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 //#define LOG_NDEBUG 0
 
- // This is needed for stdint.h to define INT64_MAX in C++
- #define __STDC_LIMIT_MACROS
-
+// We would eliminate the non-conforming zero-length array, but we can't since
+// this is effectively included from the Linux kernel
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wzero-length-array"
 #include <sync/sync.h>
+#pragma clang diagnostic pop
+
 #include <ui/Fence.h>
 #include <unistd.h>
 #include <utils/Log.h>
@@ -45,7 +48,7 @@ Fence::~Fence() {
     }
 }
 
-status_t Fence::wait(unsigned int timeout) {
+status_t Fence::wait(int timeout) {
     ATRACE_CALL();
     if (mFenceFd == -1) {
         return NO_ERROR;
@@ -59,7 +62,7 @@ status_t Fence::waitForever(const char* logname) {
     if (mFenceFd == -1) {
         return NO_ERROR;
     }
-    unsigned int warningTimeout = 3000;
+    int warningTimeout = 3000;
     int err = sync_wait(mFenceFd, warningTimeout);
     if (err < 0 && errno == ETIME) {
         ALOGE("%s: fence %d didn't signal in %u ms", logname, mFenceFd,
@@ -69,7 +72,7 @@ status_t Fence::waitForever(const char* logname) {
     return err < 0 ? -errno : status_t(NO_ERROR);
 }
 
-sp<Fence> Fence::merge(const String8& name, const sp<Fence>& f1,
+sp<Fence> Fence::merge(const char* name, const sp<Fence>& f1,
         const sp<Fence>& f2) {
     ATRACE_CALL();
     int result;
@@ -77,22 +80,27 @@ sp<Fence> Fence::merge(const String8& name, const sp<Fence>& f1,
     // valid fence (e.g. NO_FENCE) we merge the one valid fence with itself so
     // that a new fence with the given name is created.
     if (f1->isValid() && f2->isValid()) {
-        result = sync_merge(name.string(), f1->mFenceFd, f2->mFenceFd);
+        result = sync_merge(name, f1->mFenceFd, f2->mFenceFd);
     } else if (f1->isValid()) {
-        result = sync_merge(name.string(), f1->mFenceFd, f1->mFenceFd);
+        result = sync_merge(name, f1->mFenceFd, f1->mFenceFd);
     } else if (f2->isValid()) {
-        result = sync_merge(name.string(), f2->mFenceFd, f2->mFenceFd);
+        result = sync_merge(name, f2->mFenceFd, f2->mFenceFd);
     } else {
         return NO_FENCE;
     }
     if (result == -1) {
         status_t err = -errno;
         ALOGE("merge: sync_merge(\"%s\", %d, %d) returned an error: %s (%d)",
-                name.string(), f1->mFenceFd, f2->mFenceFd,
+                name, f1->mFenceFd, f2->mFenceFd,
                 strerror(-err), err);
         return NO_FENCE;
     }
     return sp<Fence>(new Fence(result));
+}
+
+sp<Fence> Fence::merge(const String8& name, const sp<Fence>& f1,
+        const sp<Fence>& f2) {
+    return merge(name.string(), f1, f2);
 }
 
 int Fence::dup() const {
@@ -127,7 +135,7 @@ nsecs_t Fence::getSignalTime() const {
 }
 
 size_t Fence::getFlattenedSize() const {
-    return 1;
+    return 4;
 }
 
 size_t Fence::getFdCount() const {
@@ -138,7 +146,9 @@ status_t Fence::flatten(void*& buffer, size_t& size, int*& fds, size_t& count) c
     if (size < getFlattenedSize() || count < getFdCount()) {
         return NO_MEMORY;
     }
-    FlattenableUtils::write(buffer, size, (uint32_t)getFdCount());
+    // Cast to uint32_t since the size of a size_t can vary between 32- and
+    // 64-bit processes
+    FlattenableUtils::write(buffer, size, static_cast<uint32_t>(getFdCount()));
     if (isValid()) {
         *fds++ = mFenceFd;
         count--;

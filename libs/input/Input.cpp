@@ -23,7 +23,7 @@
 #include <input/Input.h>
 #include <input/InputEventLabels.h>
 
-#ifdef HAVE_ANDROID_OS
+#ifdef __ANDROID__
 #include <binder/Parcel.h>
 #endif
 
@@ -144,7 +144,7 @@ void PointerCoords::applyOffset(float xOffset, float yOffset) {
     setAxisValue(AMOTION_EVENT_AXIS_Y, getY() + yOffset);
 }
 
-#ifdef HAVE_ANDROID_OS
+#ifdef __ANDROID__
 status_t PointerCoords::readFromParcel(Parcel* parcel) {
     bits = parcel->readInt64();
 
@@ -216,6 +216,7 @@ void MotionEvent::initialize(
         int32_t deviceId,
         int32_t source,
         int32_t action,
+        int32_t actionButton,
         int32_t flags,
         int32_t edgeFlags,
         int32_t metaState,
@@ -231,6 +232,7 @@ void MotionEvent::initialize(
         const PointerCoords* pointerCoords) {
     InputEvent::initialize(deviceId, source);
     mAction = action;
+    mActionButton = actionButton;
     mFlags = flags;
     mEdgeFlags = edgeFlags;
     mMetaState = metaState;
@@ -250,6 +252,7 @@ void MotionEvent::initialize(
 void MotionEvent::copyFrom(const MotionEvent* other, bool keepHistory) {
     InputEvent::initialize(other->mDeviceId, other->mSource);
     mAction = other->mAction;
+    mActionButton = other->mActionButton;
     mFlags = other->mFlags;
     mEdgeFlags = other->mEdgeFlags;
     mMetaState = other->mMetaState;
@@ -417,17 +420,19 @@ void MotionEvent::transform(const float matrix[9]) {
     }
 }
 
-#ifdef HAVE_ANDROID_OS
+#ifdef __ANDROID__
 status_t MotionEvent::readFromParcel(Parcel* parcel) {
     size_t pointerCount = parcel->readInt32();
     size_t sampleCount = parcel->readInt32();
-    if (pointerCount == 0 || pointerCount > MAX_POINTERS || sampleCount == 0) {
+    if (pointerCount == 0 || pointerCount > MAX_POINTERS ||
+            sampleCount == 0 || sampleCount > MAX_SAMPLES) {
         return BAD_VALUE;
     }
 
     mDeviceId = parcel->readInt32();
     mSource = parcel->readInt32();
     mAction = parcel->readInt32();
+    mActionButton = parcel->readInt32();
     mFlags = parcel->readInt32();
     mEdgeFlags = parcel->readInt32();
     mMetaState = parcel->readInt32();
@@ -452,7 +457,8 @@ status_t MotionEvent::readFromParcel(Parcel* parcel) {
         properties.toolType = parcel->readInt32();
     }
 
-    while (sampleCount-- > 0) {
+    while (sampleCount > 0) {
+        sampleCount--;
         mSampleEventTimes.push(parcel->readInt64());
         for (size_t i = 0; i < pointerCount; i++) {
             mSamplePointerCoords.push();
@@ -475,6 +481,7 @@ status_t MotionEvent::writeToParcel(Parcel* parcel) const {
     parcel->writeInt32(mDeviceId);
     parcel->writeInt32(mSource);
     parcel->writeInt32(mAction);
+    parcel->writeInt32(mActionButton);
     parcel->writeInt32(mFlags);
     parcel->writeInt32(mEdgeFlags);
     parcel->writeInt32(mMetaState);

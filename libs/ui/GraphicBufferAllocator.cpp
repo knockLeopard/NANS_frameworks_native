@@ -1,17 +1,17 @@
-/* 
+/*
 **
 ** Copyright 2009, The Android Open Source Project
 **
-** Licensed under the Apache License, Version 2.0 (the "License"); 
-** you may not use this file except in compliance with the License. 
-** You may obtain a copy of the License at 
+** Licensed under the Apache License, Version 2.0 (the "License");
+** you may not use this file except in compliance with the License.
+** You may obtain a copy of the License at
 **
-**     http://www.apache.org/licenses/LICENSE-2.0 
+**     http://www.apache.org/licenses/LICENSE-2.0
 **
-** Unless required by applicable law or agreed to in writing, software 
-** distributed under the License is distributed on an "AS IS" BASIS, 
-** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-** See the License for the specific language governing permissions and 
+** Unless required by applicable law or agreed to in writing, software
+** distributed under the License is distributed on an "AS IS" BASIS,
+** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+** See the License for the specific language governing permissions and
 ** limitations under the License.
 */
 
@@ -25,6 +25,7 @@
 #include <utils/Trace.h>
 
 #include <ui/GraphicBufferAllocator.h>
+#include <ui/Gralloc1On0Adapter.h>
 
 namespace android {
 // ---------------------------------------------------------------------------
@@ -36,20 +37,10 @@ KeyedVector<buffer_handle_t,
     GraphicBufferAllocator::alloc_rec_t> GraphicBufferAllocator::sAllocList;
 
 GraphicBufferAllocator::GraphicBufferAllocator()
-    : mAllocDev(0)
-{
-    hw_module_t const* module;
-    int err = hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &module);
-    ALOGE_IF(err, "FATAL: can't find the %s module", GRALLOC_HARDWARE_MODULE_ID);
-    if (err == 0) {
-        gralloc_open(module, &mAllocDev);
-    }
-}
+  : mLoader(std::make_unique<Gralloc1::Loader>()),
+    mDevice(mLoader->getDevice()) {}
 
-GraphicBufferAllocator::~GraphicBufferAllocator()
-{
-    gralloc_close(mAllocDev);
-}
+GraphicBufferAllocator::~GraphicBufferAllocator() {}
 
 void GraphicBufferAllocator::dump(String8& result) const
 {
@@ -64,23 +55,23 @@ void GraphicBufferAllocator::dump(String8& result) const
     for (size_t i=0 ; i<c ; i++) {
         const alloc_rec_t& rec(list.valueAt(i));
         if (rec.size) {
-            snprintf(buffer, SIZE, "%10p: %7.2f KiB | %4u (%4u) x %4u | %8X | 0x%08x\n",
+            snprintf(buffer, SIZE, "%10p: %7.2f KiB | %4u (%4u) x %4u | %8X | 0x%08x | %s\n",
                     list.keyAt(i), rec.size/1024.0f,
-                    rec.w, rec.s, rec.h, rec.format, rec.usage);
+                    rec.width, rec.stride, rec.height, rec.format, rec.usage,
+                    rec.requestorName.c_str());
         } else {
-            snprintf(buffer, SIZE, "%10p: unknown     | %4u (%4u) x %4u | %8X | 0x%08x\n",
+            snprintf(buffer, SIZE, "%10p: unknown     | %4u (%4u) x %4u | %8X | 0x%08x | %s\n",
                     list.keyAt(i),
-                    rec.w, rec.s, rec.h, rec.format, rec.usage);
+                    rec.width, rec.stride, rec.height, rec.format, rec.usage,
+                    rec.requestorName.c_str());
         }
         result.append(buffer);
         total += rec.size;
     }
     snprintf(buffer, SIZE, "Total allocated (estimate): %.2f KB\n", total/1024.0f);
     result.append(buffer);
-    if (mAllocDev->common.version >= 1 && mAllocDev->dump) {
-        mAllocDev->dump(mAllocDev, buffer, SIZE);
-        result.append(buffer);
-    }
+    std::string deviceDump = mDevice->dump();
+    result.append(deviceDump.c_str(), deviceDump.size());
 }
 
 void GraphicBufferAllocator::dumpToSystemLog()
@@ -90,60 +81,88 @@ void GraphicBufferAllocator::dumpToSystemLog()
     ALOGD("%s", s.string());
 }
 
-status_t GraphicBufferAllocator::alloc(uint32_t w, uint32_t h, PixelFormat format,
-        int usage, buffer_handle_t* handle, int32_t* stride)
+status_t GraphicBufferAllocator::allocate(uint32_t width, uint32_t height,
+        PixelFormat format, uint32_t usage, buffer_handle_t* handle,
+        uint32_t* stride, uint64_t graphicBufferId, std::string requestorName)
 {
     ATRACE_CALL();
+
     // make sure to not allocate a N x 0 or 0 x N buffer, since this is
     // allowed from an API stand-point allocate a 1x1 buffer instead.
-    if (!w || !h)
-        w = h = 1;
+    if (!width || !height)
+        width = height = 1;
 
-    // we have a h/w allocator and h/w buffer is requested
-    status_t err; 
-    
-    err = mAllocDev->alloc(mAllocDev, w, h, format, usage, handle, stride);
+    // Filter out any usage bits that should not be passed to the gralloc module
+    usage &= GRALLOC_USAGE_ALLOC_MASK;
 
-    ALOGW_IF(err, "alloc(%u, %u, %d, %08x, ...) failed %d (%s)",
-            w, h, format, usage, err, strerror(-err));
-    
-    if (err == NO_ERROR) {
+    auto descriptor = mDevice->createDescriptor();
+    auto error = descriptor->setDimensions(width, height);
+    if (error != GRALLOC1_ERROR_NONE) {
+        ALOGE("Failed to set dimensions to (%u, %u): %d", width, height, error);
+        return BAD_VALUE;
+    }
+    error = descriptor->setFormat(static_cast<android_pixel_format_t>(format));
+    if (error != GRALLOC1_ERROR_NONE) {
+        ALOGE("Failed to set format to %d: %d", format, error);
+        return BAD_VALUE;
+    }
+    error = descriptor->setProducerUsage(
+            static_cast<gralloc1_producer_usage_t>(usage));
+    if (error != GRALLOC1_ERROR_NONE) {
+        ALOGE("Failed to set producer usage to %u: %d", usage, error);
+        return BAD_VALUE;
+    }
+    error = descriptor->setConsumerUsage(
+            static_cast<gralloc1_consumer_usage_t>(usage));
+    if (error != GRALLOC1_ERROR_NONE) {
+        ALOGE("Failed to set consumer usage to %u: %d", usage, error);
+        return BAD_VALUE;
+    }
+
+    error = mDevice->allocate(descriptor, graphicBufferId, handle);
+    if (error != GRALLOC1_ERROR_NONE) {
+        ALOGE("Failed to allocate (%u x %u) format %d usage %u: %d",
+                width, height, format, usage, error);
+        return NO_MEMORY;
+    }
+
+    error = mDevice->getStride(*handle, stride);
+    if (error != GRALLOC1_ERROR_NONE) {
+        ALOGW("Failed to get stride from buffer: %d", error);
+    }
+
+    if (error == NO_ERROR) {
         Mutex::Autolock _l(sLock);
         KeyedVector<buffer_handle_t, alloc_rec_t>& list(sAllocList);
-        int bpp = bytesPerPixel(format);
-        if (bpp < 0) {
-            // probably a HAL custom format. in any case, we don't know
-            // what its pixel size is.
-            bpp = 0;
-        }
+        uint32_t bpp = bytesPerPixel(format);
         alloc_rec_t rec;
-        rec.w = w;
-        rec.h = h;
-        rec.s = *stride;
+        rec.width = width;
+        rec.height = height;
+        rec.stride = *stride;
         rec.format = format;
         rec.usage = usage;
-        rec.size = h * stride[0] * bpp;
+        rec.size = static_cast<size_t>(height * (*stride) * bpp);
+        rec.requestorName = std::move(requestorName);
         list.add(*handle, rec);
     }
 
-    return err;
+    return NO_ERROR;
 }
 
 status_t GraphicBufferAllocator::free(buffer_handle_t handle)
 {
     ATRACE_CALL();
-    status_t err;
 
-    err = mAllocDev->free(mAllocDev, handle);
-
-    ALOGW_IF(err, "free(...) failed %d (%s)", err, strerror(-err));
-    if (err == NO_ERROR) {
-        Mutex::Autolock _l(sLock);
-        KeyedVector<buffer_handle_t, alloc_rec_t>& list(sAllocList);
-        list.removeItem(handle);
+    auto error = mDevice->release(handle);
+    if (error != GRALLOC1_ERROR_NONE) {
+        ALOGE("Failed to free buffer: %d", error);
     }
 
-    return err;
+    Mutex::Autolock _l(sLock);
+    KeyedVector<buffer_handle_t, alloc_rec_t>& list(sAllocList);
+    list.removeItem(handle);
+
+    return NO_ERROR;
 }
 
 // ---------------------------------------------------------------------------

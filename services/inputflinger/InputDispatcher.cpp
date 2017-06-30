@@ -1,6 +1,5 @@
 /*
  * Copyright (C) 2010 The Android Open Source Project
- * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -120,7 +119,7 @@ static bool validateKeyEvent(int32_t action) {
     return true;
 }
 
-static bool isValidMotionAction(int32_t action, size_t pointerCount) {
+static bool isValidMotionAction(int32_t action, int32_t actionButton, int32_t pointerCount) {
     switch (action & AMOTION_EVENT_ACTION_MASK) {
     case AMOTION_EVENT_ACTION_DOWN:
     case AMOTION_EVENT_ACTION_UP:
@@ -135,16 +134,19 @@ static bool isValidMotionAction(int32_t action, size_t pointerCount) {
     case AMOTION_EVENT_ACTION_POINTER_DOWN:
     case AMOTION_EVENT_ACTION_POINTER_UP: {
         int32_t index = getMotionEventActionPointerIndex(action);
-        return index >= 0 && size_t(index) < pointerCount;
+        return index >= 0 && index < pointerCount;
     }
+    case AMOTION_EVENT_ACTION_BUTTON_PRESS:
+    case AMOTION_EVENT_ACTION_BUTTON_RELEASE:
+        return actionButton != 0;
     default:
         return false;
     }
 }
 
-static bool validateMotionEvent(int32_t action, size_t pointerCount,
+static bool validateMotionEvent(int32_t action, int32_t actionButton, size_t pointerCount,
         const PointerProperties* pointerProperties) {
-    if (! isValidMotionAction(action, pointerCount)) {
+    if (! isValidMotionAction(action, actionButton, pointerCount)) {
         ALOGE("Motion event has invalid action code 0x%x", action);
         return false;
     }
@@ -199,7 +201,8 @@ static void dumpRegion(String8& dump, const Region& region) {
 
 InputDispatcher::InputDispatcher(const sp<InputDispatcherPolicyInterface>& policy) :
     mPolicy(policy),
-    mPendingEvent(NULL), mAppSwitchSawKeyDown(false), mAppSwitchDueTime(LONG_LONG_MAX),
+    mPendingEvent(NULL), mLastDropReason(DROP_REASON_NOT_DROPPED),
+    mAppSwitchSawKeyDown(false), mAppSwitchDueTime(LONG_LONG_MAX),
     mNextUnblockedEvent(NULL),
     mDispatchEnabled(false), mDispatchFrozen(false), mInputFilterEnabled(false),
     mInputTargetWaitCause(INPUT_TARGET_WAIT_CAUSE_NONE) {
@@ -208,15 +211,6 @@ InputDispatcher::InputDispatcher(const sp<InputDispatcherPolicyInterface>& polic
     mKeyRepeatState.lastKeyEntry = NULL;
 
     policy->getDispatcherConfiguration(&mConfig);
-
-	/**
-	 * Date: Feb 25, 2016
-	 * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
-	 * 
-	 * Add a variable for the input device of WiFi display.
-	 */
-	mWifiDisplay = 0;
-	//END
 }
 
 InputDispatcher::~InputDispatcher() {
@@ -404,6 +398,7 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
         if (dropReason != DROP_REASON_NOT_DROPPED) {
             dropInboundEventLocked(mPendingEvent, dropReason);
         }
+        mLastDropReason = dropReason;
 
         releasePendingEventLocked();
         *nextWakeupTime = LONG_LONG_MIN;  // force next poll to wake up immediately
@@ -513,7 +508,9 @@ void InputDispatcher::dropInboundEventLocked(EventEntry* entry, DropReason dropR
         reason = "inbound event was dropped because the policy consumed it";
         break;
     case DROP_REASON_DISABLED:
-        ALOGI("Dropped event because input dispatch is disabled.");
+        if (mLastDropReason != DROP_REASON_DISABLED) {
+            ALOGI("Dropped event because input dispatch is disabled.");
+        }
         reason = "inbound event was dropped because input dispatch is disabled";
         break;
     case DROP_REASON_APP_SWITCH:
@@ -862,6 +859,13 @@ bool InputDispatcher::dispatchMotionLocked(
 
     setInjectionResultLocked(entry, injectionResult);
     if (injectionResult != INPUT_EVENT_INJECTION_SUCCEEDED) {
+        if (injectionResult != INPUT_EVENT_INJECTION_PERMISSION_DENIED) {
+            CancelationOptions::Mode mode(isPointerEvent ?
+                    CancelationOptions::CANCEL_POINTER_EVENTS :
+                    CancelationOptions::CANCEL_NON_POINTER_EVENTS);
+            CancelationOptions options(mode, "input event injection failed");
+            synthesizeCancelationEventsForMonitorsLocked(options);
+        }
         return true;
     }
 
@@ -884,12 +888,12 @@ bool InputDispatcher::dispatchMotionLocked(
 void InputDispatcher::logOutboundMotionDetailsLocked(const char* prefix, const MotionEntry* entry) {
 #if DEBUG_OUTBOUND_EVENT_DETAILS
     ALOGD("%seventTime=%lld, deviceId=%d, source=0x%x, policyFlags=0x%x, "
-            "action=0x%x, flags=0x%x, "
-            "metaState=0x%x, buttonState=0x%x, "
+            "action=0x%x, actionButton=0x%x, flags=0x%x, "
+            "metaState=0x%x, buttonState=0x%x,"
             "edgeFlags=0x%x, xPrecision=%f, yPrecision=%f, downTime=%lld",
             prefix,
             entry->eventTime, entry->deviceId, entry->source, entry->policyFlags,
-            entry->action, entry->flags,
+            entry->action, entry->actionButton, entry->flags,
             entry->metaState, entry->buttonState,
             entry->edgeFlags, entry->xPrecision, entry->yPrecision,
             entry->downTime);
@@ -898,7 +902,7 @@ void InputDispatcher::logOutboundMotionDetailsLocked(const char* prefix, const M
         ALOGD("  Pointer %d: id=%d, toolType=%d, "
                 "x=%f, y=%f, pressure=%f, size=%f, "
                 "touchMajor=%f, touchMinor=%f, toolMajor=%f, toolMinor=%f, "
-                "orientation=%f",
+                "orientation=%f, relativeX=%f, relativeY=%f",
                 i, entry->pointerProperties[i].id,
                 entry->pointerProperties[i].toolType,
                 entry->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_X),
@@ -909,7 +913,9 @@ void InputDispatcher::logOutboundMotionDetailsLocked(const char* prefix, const M
                 entry->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_TOUCH_MINOR),
                 entry->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_TOOL_MAJOR),
                 entry->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_TOOL_MINOR),
-                entry->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_ORIENTATION));
+                entry->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_ORIENTATION),
+                entry->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_RELATIVE_X),
+                entry->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_RELATIVE_Y));
     }
 #endif
 }
@@ -1065,39 +1071,6 @@ void InputDispatcher::resetANRTimeoutsLocked() {
     mInputTargetWaitApplicationHandle.clear();
 }
 
-/**
- * Date: Apr 7, 2016
- * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
- *
- * Sets the layerStack which events from WiFi display have to be dispatched.
- */
-void InputDispatcher::setInputDisplay(int layerStack) {
-    //ALOGD("setInputDisplay(), mWifiDisplay = %d", layerStack);
-    mWifiDisplay = layerStack;
-}
-// END
-
-/**
- * Date: Apr 7, 2016
- * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
- *
- * Check whether inputWindow on the display exists or not.
- */
-bool InputDispatcher::checkInputDisplay(int displayId) {
-    size_t numWindows = mWindowHandles.size();
-    for(size_t i=0; i<numWindows; i++) {
-        sp<InputWindowHandle> windowHandle = mWindowHandles.itemAt(i);
-        const InputWindowInfo* windowInfo = windowHandle->getInfo();
-        // ALOGD("++name=%s, windowInfo->displayId=%d, displayId=%d",
-        //    windowInfo->name.string(), windowInfo->displayId, displayId);
-        if (windowInfo->displayId == displayId) {
-            return true;
-        }
-    }
-    return false;
-}
-// END
-
 int32_t InputDispatcher::findFocusedWindowTargetsLocked(nsecs_t currentTime,
         const EventEntry* entry, Vector<InputTarget>& inputTargets, nsecs_t* nextWakeupTime) {
     int32_t injectionResult;
@@ -1171,27 +1144,6 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
     int32_t displayId = entry->displayId;
     int32_t action = entry->action;
     int32_t maskedAction = action & AMOTION_EVENT_ACTION_MASK;
-
-	/**
-	 * Date: Feb 25, 2016
-	 * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
-	 * 
-	 * Classify the event which display to go.
-	 * TODO: We have to find more general way to classify the display of event.
-	 */
-    // int32_t ix = int32_t(entry->pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_X));
-    // int32_t iy = int32_t(entry->pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_Y));
-	// ALOGD("findTouchedWindowTargetsLocked(), mWifiDisplay=%d, "
-	//		"entry->displayId==%d, x=%d, y=%d", mWifiDisplay, entry->displayId, ix, iy);
-	if (entry->deviceId <= 6) {
-		displayId = 0;
-	} else {
-		displayId = mWifiDisplay;
-		if (!checkInputDisplay(mWifiDisplay)) {
-			displayId = 0;	
-		}
-	}
-	// END
 
     // Update the touch state as needed based on the properties of the touch event.
     int32_t injectionResult = INPUT_EVENT_INJECTION_PENDING;
@@ -1275,6 +1227,8 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
                     int32_t outsideTargetFlags = InputTarget::FLAG_DISPATCH_AS_OUTSIDE;
                     if (isWindowObscuredAtPointLocked(windowHandle, x, y)) {
                         outsideTargetFlags |= InputTarget::FLAG_WINDOW_IS_OBSCURED;
+                    } else if (isWindowObscuredLocked(windowHandle)) {
+                        outsideTargetFlags |= InputTarget::FLAG_WINDOW_IS_PARTIALLY_OBSCURED;
                     }
 
                     mTempTouchState.addOrUpdateWindow(
@@ -1312,6 +1266,8 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
         }
         if (isWindowObscuredAtPointLocked(newTouchedWindowHandle, x, y)) {
             targetFlags |= InputTarget::FLAG_WINDOW_IS_OBSCURED;
+        } else if (isWindowObscuredLocked(newTouchedWindowHandle)) {
+            targetFlags |= InputTarget::FLAG_WINDOW_IS_PARTIALLY_OBSCURED;
         }
 
         // Update hover state.
@@ -1487,6 +1443,7 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
                                 == InputWindowInfo::TYPE_WALLPAPER) {
                     mTempTouchState.addOrUpdateWindow(windowHandle,
                             InputTarget::FLAG_WINDOW_IS_OBSCURED
+                                    | InputTarget::FLAG_WINDOW_IS_PARTIALLY_OBSCURED
                                     | InputTarget::FLAG_DISPATCH_AS_IS,
                             BitSet32(0));
                 }
@@ -1675,6 +1632,27 @@ bool InputDispatcher::isWindowObscuredAtPointLocked(
         if (otherInfo->displayId == displayId
                 && otherInfo->visible && !otherInfo->isTrustedOverlay()
                 && otherInfo->frameContainsPoint(x, y)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+bool InputDispatcher::isWindowObscuredLocked(const sp<InputWindowHandle>& windowHandle) const {
+    int32_t displayId = windowHandle->getInfo()->displayId;
+    const InputWindowInfo* windowInfo = windowHandle->getInfo();
+    size_t numWindows = mWindowHandles.size();
+    for (size_t i = 0; i < numWindows; i++) {
+        sp<InputWindowHandle> otherHandle = mWindowHandles.itemAt(i);
+        if (otherHandle == windowHandle) {
+            break;
+        }
+
+        const InputWindowInfo* otherInfo = otherHandle->getInfo();
+        if (otherInfo->displayId == displayId
+                && otherInfo->visible && !otherInfo->isTrustedOverlay()
+                && otherInfo->overlaps(windowInfo)) {
             return true;
         }
     }
@@ -1955,6 +1933,9 @@ void InputDispatcher::enqueueDispatchEntryLocked(
         if (dispatchEntry->targetFlags & InputTarget::FLAG_WINDOW_IS_OBSCURED) {
             dispatchEntry->resolvedFlags |= AMOTION_EVENT_FLAG_WINDOW_IS_OBSCURED;
         }
+        if (dispatchEntry->targetFlags & InputTarget::FLAG_WINDOW_IS_PARTIALLY_OBSCURED) {
+            dispatchEntry->resolvedFlags |= AMOTION_EVENT_FLAG_WINDOW_IS_PARTIALLY_OBSCURED;
+        }
 
         if (!connection->inputState.trackMotion(motionEntry,
                 dispatchEntry->resolvedAction, dispatchEntry->resolvedFlags)) {
@@ -2045,10 +2026,10 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
             // Publish the motion event.
             status = connection->inputPublisher.publishMotionEvent(dispatchEntry->seq,
                     motionEntry->deviceId, motionEntry->source,
-                    dispatchEntry->resolvedAction, dispatchEntry->resolvedFlags,
-                    motionEntry->edgeFlags, motionEntry->metaState, motionEntry->buttonState,
-                    xOffset, yOffset,
-                    motionEntry->xPrecision, motionEntry->yPrecision,
+                    dispatchEntry->resolvedAction, motionEntry->actionButton,
+                    dispatchEntry->resolvedFlags, motionEntry->edgeFlags,
+                    motionEntry->metaState, motionEntry->buttonState,
+                    xOffset, yOffset, motionEntry->xPrecision, motionEntry->yPrecision,
                     motionEntry->downTime, motionEntry->eventTime,
                     motionEntry->pointerCount, motionEntry->pointerProperties,
                     usingCoords);
@@ -2224,6 +2205,13 @@ void InputDispatcher::synthesizeCancelationEventsForAllConnectionsLocked(
     }
 }
 
+void InputDispatcher::synthesizeCancelationEventsForMonitorsLocked(
+        const CancelationOptions& options) {
+    for (size_t i = 0; i < mMonitoringChannels.size(); i++) {
+        synthesizeCancelationEventsForInputChannelLocked(mMonitoringChannels[i], options);
+    }
+}
+
 void InputDispatcher::synthesizeCancelationEventsForInputChannelLocked(
         const sp<InputChannel>& channel, const CancelationOptions& options) {
     ssize_t index = getConnectionIndexLocked(channel);
@@ -2362,6 +2350,7 @@ InputDispatcher::splitMotionEvent(const MotionEntry* originalMotionEntry, BitSet
             originalMotionEntry->source,
             originalMotionEntry->policyFlags,
             action,
+            originalMotionEntry->actionButton,
             originalMotionEntry->flags,
             originalMotionEntry->metaState,
             originalMotionEntry->buttonState,
@@ -2496,10 +2485,10 @@ bool InputDispatcher::shouldSendKeyToInputFilterLocked(const NotifyKeyArgs* args
 void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
 #if DEBUG_INBOUND_EVENT_DETAILS
     ALOGD("notifyMotion - eventTime=%lld, deviceId=%d, source=0x%x, policyFlags=0x%x, "
-            "action=0x%x, flags=0x%x, metaState=0x%x, buttonState=0x%x, edgeFlags=0x%x, "
-            "xPrecision=%f, yPrecision=%f, downTime=%lld",
+            "action=0x%x, actionButton=0x%x, flags=0x%x, metaState=0x%x, buttonState=0x%x,"
+            "edgeFlags=0x%x, xPrecision=%f, yPrecision=%f, downTime=%lld",
             args->eventTime, args->deviceId, args->source, args->policyFlags,
-            args->action, args->flags, args->metaState, args->buttonState,
+            args->action, args->actionButton, args->flags, args->metaState, args->buttonState,
             args->edgeFlags, args->xPrecision, args->yPrecision, args->downTime);
     for (uint32_t i = 0; i < args->pointerCount; i++) {
         ALOGD("  Pointer %d: id=%d, toolType=%d, "
@@ -2519,7 +2508,8 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
                 args->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_ORIENTATION));
     }
 #endif
-    if (!validateMotionEvent(args->action, args->pointerCount, args->pointerProperties)) {
+    if (!validateMotionEvent(args->action, args->actionButton,
+                args->pointerCount, args->pointerProperties)) {
         return;
     }
 
@@ -2535,9 +2525,9 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
             mLock.unlock();
 
             MotionEvent event;
-            event.initialize(args->deviceId, args->source, args->action, args->flags,
-                    args->edgeFlags, args->metaState, args->buttonState, 0, 0,
-                    args->xPrecision, args->yPrecision,
+            event.initialize(args->deviceId, args->source, args->action, args->actionButton,
+                    args->flags, args->edgeFlags, args->metaState, args->buttonState,
+                    0, 0, args->xPrecision, args->yPrecision,
                     args->downTime, args->eventTime,
                     args->pointerCount, args->pointerProperties, args->pointerCoords);
 
@@ -2552,7 +2542,8 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
         // Just enqueue a new motion event.
         MotionEntry* newEntry = new MotionEntry(args->eventTime,
                 args->deviceId, args->source, policyFlags,
-                args->action, args->flags, args->metaState, args->buttonState,
+                args->action, args->actionButton, args->flags,
+                args->metaState, args->buttonState,
                 args->edgeFlags, args->xPrecision, args->yPrecision, args->downTime,
                 args->displayId,
                 args->pointerCount, args->pointerProperties, args->pointerCoords, 0, 0);
@@ -2653,7 +2644,8 @@ int32_t InputDispatcher::injectInputEvent(const InputEvent* event, int32_t displ
         int32_t action = motionEvent->getAction();
         size_t pointerCount = motionEvent->getPointerCount();
         const PointerProperties* pointerProperties = motionEvent->getPointerProperties();
-        if (! validateMotionEvent(action, pointerCount, pointerProperties)) {
+        int32_t actionButton = motionEvent->getActionButton();
+        if (! validateMotionEvent(action, actionButton, pointerCount, pointerProperties)) {
             return INPUT_EVENT_INJECTION_FAILED;
         }
 
@@ -2667,7 +2659,7 @@ int32_t InputDispatcher::injectInputEvent(const InputEvent* event, int32_t displ
         const PointerCoords* samplePointerCoords = motionEvent->getSamplePointerCoords();
         firstInjectedEntry = new MotionEntry(*sampleEventTimes,
                 motionEvent->getDeviceId(), motionEvent->getSource(), policyFlags,
-                action, motionEvent->getFlags(),
+                action, actionButton, motionEvent->getFlags(),
                 motionEvent->getMetaState(), motionEvent->getButtonState(),
                 motionEvent->getEdgeFlags(),
                 motionEvent->getXPrecision(), motionEvent->getYPrecision(),
@@ -2680,7 +2672,7 @@ int32_t InputDispatcher::injectInputEvent(const InputEvent* event, int32_t displ
             samplePointerCoords += pointerCount;
             MotionEntry* nextInjectedEntry = new MotionEntry(*sampleEventTimes,
                     motionEvent->getDeviceId(), motionEvent->getSource(), policyFlags,
-                    action, motionEvent->getFlags(),
+                    action, actionButton, motionEvent->getFlags(),
                     motionEvent->getMetaState(), motionEvent->getButtonState(),
                     motionEvent->getEdgeFlags(),
                     motionEvent->getXPrecision(), motionEvent->getYPrecision(),
@@ -3853,18 +3845,6 @@ void InputDispatcher::monitor() {
 }
 
 
-// --- InputDispatcher::Queue ---
-
-template <typename T>
-uint32_t InputDispatcher::Queue<T>::count() const {
-    uint32_t result = 0;
-    for (const T* entry = head; entry; entry = entry->next) {
-        result += 1;
-    }
-    return result;
-}
-
-
 // --- InputDispatcher::InjectionState ---
 
 InputDispatcher::InjectionState::InjectionState(int32_t injectorPid, int32_t injectorUid) :
@@ -3983,18 +3963,18 @@ void InputDispatcher::KeyEntry::recycle() {
 
 // --- InputDispatcher::MotionEntry ---
 
-InputDispatcher::MotionEntry::MotionEntry(nsecs_t eventTime,
-        int32_t deviceId, uint32_t source, uint32_t policyFlags, int32_t action, int32_t flags,
-        int32_t metaState, int32_t buttonState,
-        int32_t edgeFlags, float xPrecision, float yPrecision,
-        nsecs_t downTime, int32_t displayId, uint32_t pointerCount,
+InputDispatcher::MotionEntry::MotionEntry(nsecs_t eventTime, int32_t deviceId,
+        uint32_t source, uint32_t policyFlags, int32_t action, int32_t actionButton,
+        int32_t flags, int32_t metaState, int32_t buttonState, int32_t edgeFlags,
+        float xPrecision, float yPrecision, nsecs_t downTime,
+        int32_t displayId, uint32_t pointerCount,
         const PointerProperties* pointerProperties, const PointerCoords* pointerCoords,
         float xOffset, float yOffset) :
         EventEntry(TYPE_MOTION, eventTime, policyFlags),
         eventTime(eventTime),
-        deviceId(deviceId), source(source), action(action), flags(flags),
-        metaState(metaState), buttonState(buttonState), edgeFlags(edgeFlags),
-        xPrecision(xPrecision), yPrecision(yPrecision),
+        deviceId(deviceId), source(source), action(action), actionButton(actionButton),
+        flags(flags), metaState(metaState), buttonState(buttonState),
+        edgeFlags(edgeFlags), xPrecision(xPrecision), yPrecision(yPrecision),
         downTime(downTime), displayId(displayId), pointerCount(pointerCount) {
     for (uint32_t i = 0; i < pointerCount; i++) {
         this->pointerProperties[i].copyFrom(pointerProperties[i]);
@@ -4009,10 +3989,10 @@ InputDispatcher::MotionEntry::~MotionEntry() {
 }
 
 void InputDispatcher::MotionEntry::appendDescription(String8& msg) const {
-    msg.appendFormat("MotionEvent(deviceId=%d, source=0x%08x, action=%d, "
-            "flags=0x%08x, metaState=0x%08x, buttonState=0x%08x, edgeFlags=0x%08x, "
-            "xPrecision=%.1f, yPrecision=%.1f, displayId=%d, pointers=[",
-            deviceId, source, action, flags, metaState, buttonState, edgeFlags,
+    msg.appendFormat("MotionEvent(deviceId=%d, source=0x%08x, action=%d, actionButton=0x%08x, "
+            "flags=0x%08x, metaState=0x%08x, buttonState=0x%08x, "
+            "edgeFlags=0x%08x, xPrecision=%.1f, yPrecision=%.1f, displayId=%d, pointers=[",
+            deviceId, source, action, actionButton, flags, metaState, buttonState, edgeFlags,
             xPrecision, yPrecision, displayId);
     for (uint32_t i = 0; i < pointerCount; i++) {
         if (i) {
@@ -4313,7 +4293,7 @@ void InputDispatcher::InputState::synthesizeCancelationEvents(nsecs_t currentTim
                     memento.hovering
                             ? AMOTION_EVENT_ACTION_HOVER_EXIT
                             : AMOTION_EVENT_ACTION_CANCEL,
-                    memento.flags, 0, 0, 0,
+                    memento.flags, 0, 0, 0, 0,
                     memento.xPrecision, memento.yPrecision, memento.downTime,
                     memento.displayId,
                     memento.pointerCount, memento.pointerProperties, memento.pointerCoords,

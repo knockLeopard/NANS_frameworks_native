@@ -61,6 +61,7 @@ typedef enum OMX_INDEXEXTTYPE {
     OMX_IndexParamAudioAndroidOpus,                 /**< reference: OMX_AUDIO_PARAM_ANDROID_OPUSTYPE */
     OMX_IndexParamAudioAndroidAacPresentation,      /**< reference: OMX_AUDIO_PARAM_ANDROID_AACPRESENTATIONTYPE */
     OMX_IndexParamAudioAndroidEac3,                 /**< reference: OMX_AUDIO_PARAM_ANDROID_EAC3TYPE */
+    OMX_IndexParamAudioProfileQuerySupported,       /**< reference: OMX_AUDIO_PARAM_ANDROID_PROFILETYPE */
 
     /* Image parameters and configurations */
     OMX_IndexExtImageStartUnused = OMX_IndexKhronosExtensions + 0x00500000,
@@ -76,6 +77,9 @@ typedef enum OMX_INDEXEXTTYPE {
     OMX_IndexParamVideoAndroidVp8Encoder,           /**< reference: OMX_VIDEO_PARAM_ANDROID_VP8ENCODERTYPE */
     OMX_IndexParamVideoHevc,                        /**< reference: OMX_VIDEO_PARAM_HEVCTYPE */
     OMX_IndexParamSliceSegments,                    /**< reference: OMX_VIDEO_SLICESEGMENTSTYPE */
+    OMX_IndexConfigAndroidIntraRefresh,             /**< reference: OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE */
+    OMX_IndexParamAndroidVideoTemporalLayering,     /**< reference: OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE */
+    OMX_IndexConfigAndroidVideoTemporalLayering,    /**< reference: OMX_VIDEO_CONFIG_ANDROID_TEMPORALLAYERINGTYPE */
 
     /* Image & Video common configurations */
     OMX_IndexExtCommonStartUnused = OMX_IndexKhronosExtensions + 0x00700000,
@@ -83,6 +87,9 @@ typedef enum OMX_INDEXEXTTYPE {
     /* Other configurations */
     OMX_IndexExtOtherStartUnused = OMX_IndexKhronosExtensions + 0x00800000,
     OMX_IndexConfigAutoFramerateConversion,         /**< reference: OMX_CONFIG_BOOLEANTYPE */
+    OMX_IndexConfigPriority,                        /**< reference: OMX_PARAM_U32TYPE */
+    OMX_IndexConfigOperatingRate,                   /**< reference: OMX_PARAM_U32TYPE in Q16 format for video and in Hz for audio */
+    OMX_IndexParamConsumerUsageBits,                /**< reference: OMX_PARAM_U32TYPE */
 
     /* Time configurations */
     OMX_IndexExtTimeStartUnused = OMX_IndexKhronosExtensions + 0x00900000,

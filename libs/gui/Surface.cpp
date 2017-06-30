@@ -27,6 +27,7 @@
 #include <utils/NativeHandle.h>
 
 #include <ui/Fence.h>
+#include <ui/Region.h>
 
 #include <gui/IProducerListener.h>
 #include <gui/ISurfaceComposer.h>
@@ -41,7 +42,14 @@ namespace android {
 Surface::Surface(
         const sp<IGraphicBufferProducer>& bufferProducer,
         bool controlledByApp)
-    : mGraphicBufferProducer(bufferProducer)
+    : mGraphicBufferProducer(bufferProducer),
+      mCrop(Rect::EMPTY_RECT),
+      mGenerationNumber(0),
+      mSharedBufferMode(false),
+      mAutoRefresh(false),
+      mSharedBufferSlot(BufferItem::INVALID_BUFFER_SLOT),
+      mSharedBufferHasBeenQueued(false),
+      mNextFrameNumber(1)
 {
     // Initialize the ANativeWindow function pointers.
     ANativeWindow::setSwapInterval  = hook_setSwapInterval;
@@ -64,7 +72,7 @@ Surface::Surface(
     mReqFormat = 0;
     mReqUsage = 0;
     mTimestamp = NATIVE_WINDOW_TIMESTAMP_AUTO;
-    mCrop.clear();
+    mDataSpace = HAL_DATASPACE_UNKNOWN;
     mScalingMode = NATIVE_WINDOW_SCALING_MODE_FREEZE;
     mTransform = 0;
     mStickyTransform = 0;
@@ -96,8 +104,68 @@ void Surface::setSidebandStream(const sp<NativeHandle>& stream) {
 void Surface::allocateBuffers() {
     uint32_t reqWidth = mReqWidth ? mReqWidth : mUserWidth;
     uint32_t reqHeight = mReqHeight ? mReqHeight : mUserHeight;
-    mGraphicBufferProducer->allocateBuffers(mSwapIntervalZero, mReqWidth,
-            mReqHeight, mReqFormat, mReqUsage);
+    mGraphicBufferProducer->allocateBuffers(reqWidth, reqHeight,
+            mReqFormat, mReqUsage);
+}
+
+status_t Surface::setGenerationNumber(uint32_t generation) {
+    status_t result = mGraphicBufferProducer->setGenerationNumber(generation);
+    if (result == NO_ERROR) {
+        mGenerationNumber = generation;
+    }
+    return result;
+}
+
+uint64_t Surface::getNextFrameNumber() const {
+    Mutex::Autolock lock(mMutex);
+    return mNextFrameNumber;
+}
+
+String8 Surface::getConsumerName() const {
+    return mGraphicBufferProducer->getConsumerName();
+}
+
+status_t Surface::setDequeueTimeout(nsecs_t timeout) {
+    return mGraphicBufferProducer->setDequeueTimeout(timeout);
+}
+
+status_t Surface::getLastQueuedBuffer(sp<GraphicBuffer>* outBuffer,
+        sp<Fence>* outFence, float outTransformMatrix[16]) {
+    return mGraphicBufferProducer->getLastQueuedBuffer(outBuffer, outFence,
+            outTransformMatrix);
+}
+
+bool Surface::getFrameTimestamps(uint64_t frameNumber, nsecs_t* outPostedTime,
+        nsecs_t* outAcquireTime, nsecs_t* outRefreshStartTime,
+        nsecs_t* outGlCompositionDoneTime, nsecs_t* outDisplayRetireTime,
+        nsecs_t* outReleaseTime) {
+    ATRACE_CALL();
+
+    FrameTimestamps timestamps;
+    bool found = mGraphicBufferProducer->getFrameTimestamps(frameNumber,
+            &timestamps);
+    if (found) {
+        if (outPostedTime) {
+            *outPostedTime = timestamps.postedTime;
+        }
+        if (outAcquireTime) {
+            *outAcquireTime = timestamps.acquireTime;
+        }
+        if (outRefreshStartTime) {
+            *outRefreshStartTime = timestamps.refreshStartTime;
+        }
+        if (outGlCompositionDoneTime) {
+            *outGlCompositionDoneTime = timestamps.glCompositionDoneTime;
+        }
+        if (outDisplayRetireTime) {
+            *outDisplayRetireTime = timestamps.displayRetireTime;
+        }
+        if (outReleaseTime) {
+            *outReleaseTime = timestamps.releaseTime;
+        }
+        return true;
+    }
+    return false;
 }
 
 int Surface::hook_setSwapInterval(ANativeWindow* window, int interval) {
@@ -129,6 +197,9 @@ int Surface::hook_dequeueBuffer_DEPRECATED(ANativeWindow* window,
     ANativeWindowBuffer* buf;
     int fenceFd = -1;
     int result = c->dequeueBuffer(&buf, &fenceFd);
+    if (result != OK) {
+        return result;
+    }
     sp<Fence> fence(new Fence(fenceFd));
     int waitResult = fence->waitForever("dequeueBuffer_DEPRECATED");
     if (waitResult != OK) {
@@ -169,7 +240,9 @@ int Surface::hook_perform(ANativeWindow* window, int operation, ...) {
     va_list args;
     va_start(args, operation);
     Surface* c = getSelf(window);
-    return c->perform(operation, args);
+    int result = c->perform(operation, args);
+    va_end(args);
+    return result;
 }
 
 int Surface::setSwapInterval(int interval) {
@@ -185,6 +258,7 @@ int Surface::setSwapInterval(int interval) {
         interval = maxSwapInterval;
 
     mSwapIntervalZero = (interval == 0);
+    mGraphicBufferProducer->setAsyncMode(mSwapIntervalZero);
 
     return NO_ERROR;
 }
@@ -193,32 +267,42 @@ int Surface::dequeueBuffer(android_native_buffer_t** buffer, int* fenceFd) {
     ATRACE_CALL();
     ALOGV("Surface::dequeueBuffer");
 
-    int reqW;
-    int reqH;
-    bool swapIntervalZero;
-    uint32_t reqFormat;
+    uint32_t reqWidth;
+    uint32_t reqHeight;
+    PixelFormat reqFormat;
     uint32_t reqUsage;
 
     {
         Mutex::Autolock lock(mMutex);
 
-        reqW = mReqWidth ? mReqWidth : mUserWidth;
-        reqH = mReqHeight ? mReqHeight : mUserHeight;
+        reqWidth = mReqWidth ? mReqWidth : mUserWidth;
+        reqHeight = mReqHeight ? mReqHeight : mUserHeight;
 
-        swapIntervalZero = mSwapIntervalZero;
         reqFormat = mReqFormat;
         reqUsage = mReqUsage;
+
+        if (mSharedBufferMode && mAutoRefresh && mSharedBufferSlot !=
+                BufferItem::INVALID_BUFFER_SLOT) {
+            sp<GraphicBuffer>& gbuf(mSlots[mSharedBufferSlot].buffer);
+            if (gbuf != NULL) {
+                *buffer = gbuf.get();
+                *fenceFd = -1;
+                return OK;
+            }
+        }
     } // Drop the lock so that we can still touch the Surface while blocking in IGBP::dequeueBuffer
 
     int buf = -1;
     sp<Fence> fence;
-    status_t result = mGraphicBufferProducer->dequeueBuffer(&buf, &fence, swapIntervalZero,
-            reqW, reqH, reqFormat, reqUsage);
+    nsecs_t now = systemTime();
+    status_t result = mGraphicBufferProducer->dequeueBuffer(&buf, &fence,
+            reqWidth, reqHeight, reqFormat, reqUsage);
+    mLastDequeueDuration = systemTime() - now;
 
     if (result < 0) {
-        ALOGV("dequeueBuffer: IGraphicBufferProducer::dequeueBuffer(%d, %d, %d, %d, %d)"
-             "failed: %d", swapIntervalZero, reqW, reqH, reqFormat, reqUsage,
-             result);
+        ALOGV("dequeueBuffer: IGraphicBufferProducer::dequeueBuffer"
+                "(%d, %d, %d, %d) failed: %d", reqWidth, reqHeight, reqFormat,
+                reqUsage, result);
         return result;
     }
 
@@ -255,6 +339,15 @@ int Surface::dequeueBuffer(android_native_buffer_t** buffer, int* fenceFd) {
     }
 
     *buffer = gbuf.get();
+
+    if (mSharedBufferMode && mAutoRefresh) {
+        mSharedBufferSlot = buf;
+        mSharedBufferHasBeenQueued = false;
+    } else if (mSharedBufferSlot == buf) {
+        mSharedBufferSlot = BufferItem::INVALID_BUFFER_SLOT;
+        mSharedBufferHasBeenQueued = false;
+    }
+
     return OK;
 }
 
@@ -265,16 +358,29 @@ int Surface::cancelBuffer(android_native_buffer_t* buffer,
     Mutex::Autolock lock(mMutex);
     int i = getSlotFromBufferLocked(buffer);
     if (i < 0) {
+        if (fenceFd >= 0) {
+            close(fenceFd);
+        }
         return i;
+    }
+    if (mSharedBufferSlot == i && mSharedBufferHasBeenQueued) {
+        if (fenceFd >= 0) {
+            close(fenceFd);
+        }
+        return OK;
     }
     sp<Fence> fence(fenceFd >= 0 ? new Fence(fenceFd) : Fence::NO_FENCE);
     mGraphicBufferProducer->cancelBuffer(i, fence);
+
+    if (mSharedBufferMode && mAutoRefresh && mSharedBufferSlot == i) {
+        mSharedBufferHasBeenQueued = true;
+    }
+
     return OK;
 }
 
 int Surface::getSlotFromBufferLocked(
         android_native_buffer_t* buffer) const {
-    bool dumpedState = false;
     for (int i = 0; i < NUM_BUFFER_SLOTS; i++) {
         if (mSlots[i].buffer != NULL &&
                 mSlots[i].buffer->handle == buffer->handle) {
@@ -297,6 +403,7 @@ int Surface::queueBuffer(android_native_buffer_t* buffer, int fenceFd) {
     Mutex::Autolock lock(mMutex);
     int64_t timestamp;
     bool isAutoTimestamp = false;
+
     if (mTimestamp == NATIVE_WINDOW_TIMESTAMP_AUTO) {
         timestamp = systemTime(SYSTEM_TIME_MONOTONIC);
         isAutoTimestamp = true;
@@ -307,27 +414,103 @@ int Surface::queueBuffer(android_native_buffer_t* buffer, int fenceFd) {
     }
     int i = getSlotFromBufferLocked(buffer);
     if (i < 0) {
+        if (fenceFd >= 0) {
+            close(fenceFd);
+        }
         return i;
+    }
+    if (mSharedBufferSlot == i && mSharedBufferHasBeenQueued) {
+        if (fenceFd >= 0) {
+            close(fenceFd);
+        }
+        return OK;
     }
 
 
     // Make sure the crop rectangle is entirely inside the buffer.
-    Rect crop;
+    Rect crop(Rect::EMPTY_RECT);
     mCrop.intersect(Rect(buffer->width, buffer->height), &crop);
 
     sp<Fence> fence(fenceFd >= 0 ? new Fence(fenceFd) : Fence::NO_FENCE);
     IGraphicBufferProducer::QueueBufferOutput output;
     IGraphicBufferProducer::QueueBufferInput input(timestamp, isAutoTimestamp,
-            crop, mScalingMode, mTransform ^ mStickyTransform, mSwapIntervalZero,
+            mDataSpace, crop, mScalingMode, mTransform ^ mStickyTransform,
             fence, mStickyTransform);
+
+    if (mConnectedToCpu || mDirtyRegion.bounds() == Rect::INVALID_RECT) {
+        input.setSurfaceDamage(Region::INVALID_REGION);
+    } else {
+        // Here we do two things:
+        // 1) The surface damage was specified using the OpenGL ES convention of
+        //    the origin being in the bottom-left corner. Here we flip to the
+        //    convention that the rest of the system uses (top-left corner) by
+        //    subtracting all top/bottom coordinates from the buffer height.
+        // 2) If the buffer is coming in rotated (for example, because the EGL
+        //    implementation is reacting to the transform hint coming back from
+        //    SurfaceFlinger), the surface damage needs to be rotated the
+        //    opposite direction, since it was generated assuming an unrotated
+        //    buffer (the app doesn't know that the EGL implementation is
+        //    reacting to the transform hint behind its back). The
+        //    transformations in the switch statement below apply those
+        //    complementary rotations (e.g., if 90 degrees, rotate 270 degrees).
+
+        int width = buffer->width;
+        int height = buffer->height;
+        bool rotated90 = (mTransform ^ mStickyTransform) &
+                NATIVE_WINDOW_TRANSFORM_ROT_90;
+        if (rotated90) {
+            std::swap(width, height);
+        }
+
+        Region flippedRegion;
+        for (auto rect : mDirtyRegion) {
+            int left = rect.left;
+            int right = rect.right;
+            int top = height - rect.bottom; // Flip from OpenGL convention
+            int bottom = height - rect.top; // Flip from OpenGL convention
+            switch (mTransform ^ mStickyTransform) {
+                case NATIVE_WINDOW_TRANSFORM_ROT_90: {
+                    // Rotate 270 degrees
+                    Rect flippedRect{top, width - right, bottom, width - left};
+                    flippedRegion.orSelf(flippedRect);
+                    break;
+                }
+                case NATIVE_WINDOW_TRANSFORM_ROT_180: {
+                    // Rotate 180 degrees
+                    Rect flippedRect{width - right, height - bottom,
+                            width - left, height - top};
+                    flippedRegion.orSelf(flippedRect);
+                    break;
+                }
+                case NATIVE_WINDOW_TRANSFORM_ROT_270: {
+                    // Rotate 90 degrees
+                    Rect flippedRect{height - bottom, left,
+                            height - top, right};
+                    flippedRegion.orSelf(flippedRect);
+                    break;
+                }
+                default: {
+                    Rect flippedRect{left, top, right, bottom};
+                    flippedRegion.orSelf(flippedRect);
+                    break;
+                }
+            }
+        }
+
+        input.setSurfaceDamage(flippedRegion);
+    }
+
+    nsecs_t now = systemTime();
     status_t err = mGraphicBufferProducer->queueBuffer(i, input, &output);
+    mLastQueueDuration = systemTime() - now;
     if (err != OK)  {
         ALOGE("queueBuffer: error queuing buffer to SurfaceTexture, %d", err);
     }
+
     uint32_t numPendingBuffers = 0;
     uint32_t hint = 0;
     output.deflate(&mDefaultWidth, &mDefaultHeight, &hint,
-            &numPendingBuffers);
+            &numPendingBuffers, &mNextFrameNumber);
 
     // Disable transform hint if sticky transform is set.
     if (mStickyTransform == 0) {
@@ -335,6 +518,17 @@ int Surface::queueBuffer(android_native_buffer_t* buffer, int fenceFd) {
     }
 
     mConsumerRunningBehind = (numPendingBuffers >= 2);
+
+    if (!mConnectedToCpu) {
+        // Clear surface damage back to full-buffer
+        mDirtyRegion = Region::INVALID_REGION;
+    }
+
+    if (mSharedBufferMode && mAutoRefresh && mSharedBufferSlot == i) {
+        mSharedBufferHasBeenQueued = true;
+    }
+
+    mQueueBufferCondition.broadcast();
 
     return err;
 }
@@ -347,7 +541,7 @@ int Surface::query(int what, int* value) const {
         switch (what) {
             case NATIVE_WINDOW_FORMAT:
                 if (mReqFormat) {
-                    *value = mReqFormat;
+                    *value = static_cast<int>(mReqFormat);
                     return NO_ERROR;
                 }
                 break;
@@ -365,13 +559,15 @@ int Surface::query(int what, int* value) const {
                 *value = NATIVE_WINDOW_SURFACE;
                 return NO_ERROR;
             case NATIVE_WINDOW_DEFAULT_WIDTH:
-                *value = mUserWidth ? mUserWidth : mDefaultWidth;
+                *value = static_cast<int>(
+                        mUserWidth ? mUserWidth : mDefaultWidth);
                 return NO_ERROR;
             case NATIVE_WINDOW_DEFAULT_HEIGHT:
-                *value = mUserHeight ? mUserHeight : mDefaultHeight;
+                *value = static_cast<int>(
+                        mUserHeight ? mUserHeight : mDefaultHeight);
                 return NO_ERROR;
             case NATIVE_WINDOW_TRANSFORM_HINT:
-                *value = mTransformHint;
+                *value = static_cast<int>(mTransformHint);
                 return NO_ERROR;
             case NATIVE_WINDOW_CONSUMER_RUNNING_BEHIND: {
                 status_t err = NO_ERROR;
@@ -384,6 +580,20 @@ int Surface::query(int what, int* value) const {
                     }
                 }
                 return err;
+            }
+            case NATIVE_WINDOW_LAST_DEQUEUE_DURATION: {
+                int64_t durationUs = mLastDequeueDuration / 1000;
+                *value = durationUs > std::numeric_limits<int>::max() ?
+                        std::numeric_limits<int>::max() :
+                        static_cast<int>(durationUs);
+                return NO_ERROR;
+            }
+            case NATIVE_WINDOW_LAST_QUEUE_DURATION: {
+                int64_t durationUs = mLastQueueDuration / 1000;
+                *value = durationUs > std::numeric_limits<int>::max() ?
+                        std::numeric_limits<int>::max() :
+                        static_cast<int>(durationUs);
+                return NO_ERROR;
             }
         }
     }
@@ -448,6 +658,21 @@ int Surface::perform(int operation, va_list args)
     case NATIVE_WINDOW_SET_SIDEBAND_STREAM:
         res = dispatchSetSidebandStream(args);
         break;
+    case NATIVE_WINDOW_SET_BUFFERS_DATASPACE:
+        res = dispatchSetBuffersDataSpace(args);
+        break;
+    case NATIVE_WINDOW_SET_SURFACE_DAMAGE:
+        res = dispatchSetSurfaceDamage(args);
+        break;
+    case NATIVE_WINDOW_SET_SHARED_BUFFER_MODE:
+        res = dispatchSetSharedBufferMode(args);
+        break;
+    case NATIVE_WINDOW_SET_AUTO_REFRESH:
+        res = dispatchSetAutoRefresh(args);
+        break;
+    case NATIVE_WINDOW_GET_FRAME_TIMESTAMPS:
+        res = dispatchGetFrameTimestamps(args);
+        break;
     default:
         res = NAME_NOT_FOUND;
         break;
@@ -467,7 +692,7 @@ int Surface::dispatchDisconnect(va_list args) {
 
 int Surface::dispatchSetUsage(va_list args) {
     int usage = va_arg(args, int);
-    return setUsage(usage);
+    return setUsage(static_cast<uint32_t>(usage));
 }
 
 int Surface::dispatchSetCrop(va_list args) {
@@ -477,49 +702,49 @@ int Surface::dispatchSetCrop(va_list args) {
 
 int Surface::dispatchSetBufferCount(va_list args) {
     size_t bufferCount = va_arg(args, size_t);
-    return setBufferCount(bufferCount);
+    return setBufferCount(static_cast<int32_t>(bufferCount));
 }
 
 int Surface::dispatchSetBuffersGeometry(va_list args) {
-    int w = va_arg(args, int);
-    int h = va_arg(args, int);
-    int f = va_arg(args, int);
-    int err = setBuffersDimensions(w, h);
+    uint32_t width = va_arg(args, uint32_t);
+    uint32_t height = va_arg(args, uint32_t);
+    PixelFormat format = va_arg(args, PixelFormat);
+    int err = setBuffersDimensions(width, height);
     if (err != 0) {
         return err;
     }
-    return setBuffersFormat(f);
+    return setBuffersFormat(format);
 }
 
 int Surface::dispatchSetBuffersDimensions(va_list args) {
-    int w = va_arg(args, int);
-    int h = va_arg(args, int);
-    return setBuffersDimensions(w, h);
+    uint32_t width = va_arg(args, uint32_t);
+    uint32_t height = va_arg(args, uint32_t);
+    return setBuffersDimensions(width, height);
 }
 
 int Surface::dispatchSetBuffersUserDimensions(va_list args) {
-    int w = va_arg(args, int);
-    int h = va_arg(args, int);
-    return setBuffersUserDimensions(w, h);
+    uint32_t width = va_arg(args, uint32_t);
+    uint32_t height = va_arg(args, uint32_t);
+    return setBuffersUserDimensions(width, height);
 }
 
 int Surface::dispatchSetBuffersFormat(va_list args) {
-    int f = va_arg(args, int);
-    return setBuffersFormat(f);
+    PixelFormat format = va_arg(args, PixelFormat);
+    return setBuffersFormat(format);
 }
 
 int Surface::dispatchSetScalingMode(va_list args) {
-    int m = va_arg(args, int);
-    return setScalingMode(m);
+    int mode = va_arg(args, int);
+    return setScalingMode(mode);
 }
 
 int Surface::dispatchSetBuffersTransform(va_list args) {
-    int transform = va_arg(args, int);
+    uint32_t transform = va_arg(args, uint32_t);
     return setBuffersTransform(transform);
 }
 
 int Surface::dispatchSetBuffersStickyTransform(va_list args) {
-    int transform = va_arg(args, int);
+    uint32_t transform = va_arg(args, uint32_t);
     return setBuffersStickyTransform(transform);
 }
 
@@ -545,10 +770,51 @@ int Surface::dispatchSetSidebandStream(va_list args) {
     return OK;
 }
 
+int Surface::dispatchSetBuffersDataSpace(va_list args) {
+    android_dataspace dataspace =
+            static_cast<android_dataspace>(va_arg(args, int));
+    return setBuffersDataSpace(dataspace);
+}
+
+int Surface::dispatchSetSurfaceDamage(va_list args) {
+    android_native_rect_t* rects = va_arg(args, android_native_rect_t*);
+    size_t numRects = va_arg(args, size_t);
+    setSurfaceDamage(rects, numRects);
+    return NO_ERROR;
+}
+
+int Surface::dispatchSetSharedBufferMode(va_list args) {
+    bool sharedBufferMode = va_arg(args, int);
+    return setSharedBufferMode(sharedBufferMode);
+}
+
+int Surface::dispatchSetAutoRefresh(va_list args) {
+    bool autoRefresh = va_arg(args, int);
+    return setAutoRefresh(autoRefresh);
+}
+
+int Surface::dispatchGetFrameTimestamps(va_list args) {
+    uint32_t framesAgo = va_arg(args, uint32_t);
+    nsecs_t* outPostedTime = va_arg(args, int64_t*);
+    nsecs_t* outAcquireTime = va_arg(args, int64_t*);
+    nsecs_t* outRefreshStartTime = va_arg(args, int64_t*);
+    nsecs_t* outGlCompositionDoneTime = va_arg(args, int64_t*);
+    nsecs_t* outDisplayRetireTime = va_arg(args, int64_t*);
+    nsecs_t* outReleaseTime = va_arg(args, int64_t*);
+    bool ret = getFrameTimestamps(getNextFrameNumber() - 1 - framesAgo,
+            outPostedTime, outAcquireTime, outRefreshStartTime,
+            outGlCompositionDoneTime, outDisplayRetireTime, outReleaseTime);
+    return ret ? NO_ERROR : BAD_VALUE;
+}
+
 int Surface::connect(int api) {
+    static sp<IProducerListener> listener = new DummyProducerListener();
+    return connect(api, listener);
+}
+
+int Surface::connect(int api, const sp<IProducerListener>& listener) {
     ATRACE_CALL();
     ALOGV("Surface::connect");
-    static sp<IProducerListener> listener = new DummyProducerListener();
     Mutex::Autolock lock(mMutex);
     IGraphicBufferProducer::QueueBufferOutput output;
     int err = mGraphicBufferProducer->connect(listener, api, mProducerControlledByApp, &output);
@@ -556,7 +822,7 @@ int Surface::connect(int api) {
         uint32_t numPendingBuffers = 0;
         uint32_t hint = 0;
         output.deflate(&mDefaultWidth, &mDefaultHeight, &hint,
-                &numPendingBuffers);
+                &numPendingBuffers, &mNextFrameNumber);
 
         // Disable transform hint if sticky transform is set.
         if (mStickyTransform == 0) {
@@ -567,17 +833,25 @@ int Surface::connect(int api) {
     }
     if (!err && api == NATIVE_WINDOW_API_CPU) {
         mConnectedToCpu = true;
+        // Clear the dirty region in case we're switching from a non-CPU API
+        mDirtyRegion.clear();
+    } else if (!err) {
+        // Initialize the dirty region for tracking surface damage
+        mDirtyRegion = Region::INVALID_REGION;
     }
+
     return err;
 }
 
 
-int Surface::disconnect(int api) {
+int Surface::disconnect(int api, IGraphicBufferProducer::DisconnectMode mode) {
     ATRACE_CALL();
     ALOGV("Surface::disconnect");
     Mutex::Autolock lock(mMutex);
+    mSharedBufferSlot = BufferItem::INVALID_BUFFER_SLOT;
+    mSharedBufferHasBeenQueued = false;
     freeAllBuffers();
-    int err = mGraphicBufferProducer->disconnect(api);
+    int err = mGraphicBufferProducer->disconnect(api, mode);
     if (!err) {
         mReqFormat = 0;
         mReqWidth = 0;
@@ -595,10 +869,72 @@ int Surface::disconnect(int api) {
     return err;
 }
 
+int Surface::detachNextBuffer(sp<GraphicBuffer>* outBuffer,
+        sp<Fence>* outFence) {
+    ATRACE_CALL();
+    ALOGV("Surface::detachNextBuffer");
+
+    if (outBuffer == NULL || outFence == NULL) {
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock lock(mMutex);
+
+    sp<GraphicBuffer> buffer(NULL);
+    sp<Fence> fence(NULL);
+    status_t result = mGraphicBufferProducer->detachNextBuffer(
+            &buffer, &fence);
+    if (result != NO_ERROR) {
+        return result;
+    }
+
+    *outBuffer = buffer;
+    if (fence != NULL && fence->isValid()) {
+        *outFence = fence;
+    } else {
+        *outFence = Fence::NO_FENCE;
+    }
+
+    for (int i = 0; i < NUM_BUFFER_SLOTS; i++) {
+        if (mSlots[i].buffer != NULL &&
+                mSlots[i].buffer->handle == buffer->handle) {
+            mSlots[i].buffer = NULL;
+        }
+    }
+
+    return NO_ERROR;
+}
+
+int Surface::attachBuffer(ANativeWindowBuffer* buffer)
+{
+    ATRACE_CALL();
+    ALOGV("Surface::attachBuffer");
+
+    Mutex::Autolock lock(mMutex);
+
+    sp<GraphicBuffer> graphicBuffer(static_cast<GraphicBuffer*>(buffer));
+    uint32_t priorGeneration = graphicBuffer->mGenerationNumber;
+    graphicBuffer->mGenerationNumber = mGenerationNumber;
+    int32_t attachedSlot = -1;
+    status_t result = mGraphicBufferProducer->attachBuffer(
+            &attachedSlot, graphicBuffer);
+    if (result != NO_ERROR) {
+        ALOGE("attachBuffer: IGraphicBufferProducer call failed (%d)", result);
+        graphicBuffer->mGenerationNumber = priorGeneration;
+        return result;
+    }
+    mSlots[attachedSlot].buffer = graphicBuffer;
+
+    return NO_ERROR;
+}
+
 int Surface::setUsage(uint32_t reqUsage)
 {
     ALOGV("Surface::setUsage");
     Mutex::Autolock lock(mMutex);
+    if (reqUsage != mReqUsage) {
+        mSharedBufferSlot = BufferItem::INVALID_BUFFER_SLOT;
+    }
     mReqUsage = reqUsage;
     return OK;
 }
@@ -607,7 +943,7 @@ int Surface::setCrop(Rect const* rect)
 {
     ATRACE_CALL();
 
-    Rect realRect;
+    Rect realRect(Rect::EMPTY_RECT);
     if (rect == NULL || rect->isEmpty()) {
         realRect.clear();
     } else {
@@ -628,59 +964,122 @@ int Surface::setBufferCount(int bufferCount)
     ALOGV("Surface::setBufferCount");
     Mutex::Autolock lock(mMutex);
 
-    status_t err = mGraphicBufferProducer->setBufferCount(bufferCount);
-    ALOGE_IF(err, "IGraphicBufferProducer::setBufferCount(%d) returned %s",
-            bufferCount, strerror(-err));
-
-    if (err == NO_ERROR) {
-        freeAllBuffers();
+    status_t err = NO_ERROR;
+    if (bufferCount == 0) {
+        err = mGraphicBufferProducer->setMaxDequeuedBufferCount(1);
+    } else {
+        int minUndequeuedBuffers = 0;
+        err = mGraphicBufferProducer->query(
+                NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &minUndequeuedBuffers);
+        if (err == NO_ERROR) {
+            err = mGraphicBufferProducer->setMaxDequeuedBufferCount(
+                    bufferCount - minUndequeuedBuffers);
+        }
     }
+
+    ALOGE_IF(err, "IGraphicBufferProducer::setBufferCount(%d) returned %s",
+             bufferCount, strerror(-err));
 
     return err;
 }
 
-int Surface::setBuffersDimensions(int w, int h)
+int Surface::setMaxDequeuedBufferCount(int maxDequeuedBuffers) {
+    ATRACE_CALL();
+    ALOGV("Surface::setMaxDequeuedBufferCount");
+    Mutex::Autolock lock(mMutex);
+
+    status_t err = mGraphicBufferProducer->setMaxDequeuedBufferCount(
+            maxDequeuedBuffers);
+    ALOGE_IF(err, "IGraphicBufferProducer::setMaxDequeuedBufferCount(%d) "
+            "returned %s", maxDequeuedBuffers, strerror(-err));
+
+    return err;
+}
+
+int Surface::setAsyncMode(bool async) {
+    ATRACE_CALL();
+    ALOGV("Surface::setAsyncMode");
+    Mutex::Autolock lock(mMutex);
+
+    status_t err = mGraphicBufferProducer->setAsyncMode(async);
+    ALOGE_IF(err, "IGraphicBufferProducer::setAsyncMode(%d) returned %s",
+            async, strerror(-err));
+
+    return err;
+}
+
+int Surface::setSharedBufferMode(bool sharedBufferMode) {
+    ATRACE_CALL();
+    ALOGV("Surface::setSharedBufferMode (%d)", sharedBufferMode);
+    Mutex::Autolock lock(mMutex);
+
+    status_t err = mGraphicBufferProducer->setSharedBufferMode(
+            sharedBufferMode);
+    if (err == NO_ERROR) {
+        mSharedBufferMode = sharedBufferMode;
+    }
+    ALOGE_IF(err, "IGraphicBufferProducer::setSharedBufferMode(%d) returned"
+            "%s", sharedBufferMode, strerror(-err));
+
+    return err;
+}
+
+int Surface::setAutoRefresh(bool autoRefresh) {
+    ATRACE_CALL();
+    ALOGV("Surface::setAutoRefresh (%d)", autoRefresh);
+    Mutex::Autolock lock(mMutex);
+
+    status_t err = mGraphicBufferProducer->setAutoRefresh(autoRefresh);
+    if (err == NO_ERROR) {
+        mAutoRefresh = autoRefresh;
+    }
+    ALOGE_IF(err, "IGraphicBufferProducer::setAutoRefresh(%d) returned %s",
+            autoRefresh, strerror(-err));
+    return err;
+}
+
+int Surface::setBuffersDimensions(uint32_t width, uint32_t height)
 {
     ATRACE_CALL();
     ALOGV("Surface::setBuffersDimensions");
 
-    if (w<0 || h<0)
-        return BAD_VALUE;
-
-    if ((w && !h) || (!w && h))
+    if ((width && !height) || (!width && height))
         return BAD_VALUE;
 
     Mutex::Autolock lock(mMutex);
-    mReqWidth = w;
-    mReqHeight = h;
+    if (width != mReqWidth || height != mReqHeight) {
+        mSharedBufferSlot = BufferItem::INVALID_BUFFER_SLOT;
+    }
+    mReqWidth = width;
+    mReqHeight = height;
     return NO_ERROR;
 }
 
-int Surface::setBuffersUserDimensions(int w, int h)
+int Surface::setBuffersUserDimensions(uint32_t width, uint32_t height)
 {
     ATRACE_CALL();
     ALOGV("Surface::setBuffersUserDimensions");
 
-    if (w<0 || h<0)
-        return BAD_VALUE;
-
-    if ((w && !h) || (!w && h))
+    if ((width && !height) || (!width && height))
         return BAD_VALUE;
 
     Mutex::Autolock lock(mMutex);
-    mUserWidth = w;
-    mUserHeight = h;
+    if (width != mUserWidth || height != mUserHeight) {
+        mSharedBufferSlot = BufferItem::INVALID_BUFFER_SLOT;
+    }
+    mUserWidth = width;
+    mUserHeight = height;
     return NO_ERROR;
 }
 
-int Surface::setBuffersFormat(int format)
+int Surface::setBuffersFormat(PixelFormat format)
 {
     ALOGV("Surface::setBuffersFormat");
 
-    if (format<0)
-        return BAD_VALUE;
-
     Mutex::Autolock lock(mMutex);
+    if (format != mReqFormat) {
+        mSharedBufferSlot = BufferItem::INVALID_BUFFER_SLOT;
+    }
     mReqFormat = format;
     return NO_ERROR;
 }
@@ -694,6 +1093,7 @@ int Surface::setScalingMode(int mode)
         case NATIVE_WINDOW_SCALING_MODE_FREEZE:
         case NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW:
         case NATIVE_WINDOW_SCALING_MODE_SCALE_CROP:
+        case NATIVE_WINDOW_SCALING_MODE_NO_SCALE_CROP:
             break;
         default:
             ALOGE("unknown scaling mode: %d", mode);
@@ -705,7 +1105,7 @@ int Surface::setScalingMode(int mode)
     return NO_ERROR;
 }
 
-int Surface::setBuffersTransform(int transform)
+int Surface::setBuffersTransform(uint32_t transform)
 {
     ATRACE_CALL();
     ALOGV("Surface::setBuffersTransform");
@@ -714,7 +1114,7 @@ int Surface::setBuffersTransform(int transform)
     return NO_ERROR;
 }
 
-int Surface::setBuffersStickyTransform(int transform)
+int Surface::setBuffersStickyTransform(uint32_t transform)
 {
     ATRACE_CALL();
     ALOGV("Surface::setBuffersStickyTransform");
@@ -731,9 +1131,38 @@ int Surface::setBuffersTimestamp(int64_t timestamp)
     return NO_ERROR;
 }
 
+int Surface::setBuffersDataSpace(android_dataspace dataSpace)
+{
+    ALOGV("Surface::setBuffersDataSpace");
+    Mutex::Autolock lock(mMutex);
+    mDataSpace = dataSpace;
+    return NO_ERROR;
+}
+
 void Surface::freeAllBuffers() {
     for (int i = 0; i < NUM_BUFFER_SLOTS; i++) {
         mSlots[i].buffer = 0;
+    }
+}
+
+void Surface::setSurfaceDamage(android_native_rect_t* rects, size_t numRects) {
+    ATRACE_CALL();
+    ALOGV("Surface::setSurfaceDamage");
+    Mutex::Autolock lock(mMutex);
+
+    if (mConnectedToCpu || numRects == 0) {
+        mDirtyRegion = Region::INVALID_REGION;
+        return;
+    }
+
+    mDirtyRegion.clear();
+    for (size_t r = 0; r < numRects; ++r) {
+        // We intentionally flip top and bottom here, since because they're
+        // specified with a bottom-left origin, top > bottom, which fails
+        // validation in the Region class. We will fix this up when we flip to a
+        // top-left origin in queueBuffer.
+        Rect rect(rects[r].left, rects[r].bottom, rects[r].right, rects[r].top);
+        mDirtyRegion.orSelf(rect);
     }
 }
 
@@ -748,30 +1177,34 @@ static status_t copyBlt(
     // src and dst with, height and format must be identical. no verification
     // is done here.
     status_t err;
-    uint8_t const * src_bits = NULL;
-    err = src->lock(GRALLOC_USAGE_SW_READ_OFTEN, reg.bounds(), (void**)&src_bits);
+    uint8_t* src_bits = NULL;
+    err = src->lock(GRALLOC_USAGE_SW_READ_OFTEN, reg.bounds(),
+            reinterpret_cast<void**>(&src_bits));
     ALOGE_IF(err, "error locking src buffer %s", strerror(-err));
 
     uint8_t* dst_bits = NULL;
-    err = dst->lock(GRALLOC_USAGE_SW_WRITE_OFTEN, reg.bounds(), (void**)&dst_bits);
+    err = dst->lock(GRALLOC_USAGE_SW_WRITE_OFTEN, reg.bounds(),
+            reinterpret_cast<void**>(&dst_bits));
     ALOGE_IF(err, "error locking dst buffer %s", strerror(-err));
 
     Region::const_iterator head(reg.begin());
     Region::const_iterator tail(reg.end());
     if (head != tail && src_bits && dst_bits) {
         const size_t bpp = bytesPerPixel(src->format);
-        const size_t dbpr = dst->stride * bpp;
-        const size_t sbpr = src->stride * bpp;
+        const size_t dbpr = static_cast<uint32_t>(dst->stride) * bpp;
+        const size_t sbpr = static_cast<uint32_t>(src->stride) * bpp;
 
         while (head != tail) {
             const Rect& r(*head++);
-            ssize_t h = r.height();
+            int32_t h = r.height();
             if (h <= 0) continue;
-            size_t size = r.width() * bpp;
-            uint8_t const * s = src_bits + (r.left + src->stride * r.top) * bpp;
-            uint8_t       * d = dst_bits + (r.left + dst->stride * r.top) * bpp;
+            size_t size = static_cast<uint32_t>(r.width()) * bpp;
+            uint8_t const * s = src_bits +
+                    static_cast<uint32_t>(r.left + src->stride * r.top) * bpp;
+            uint8_t       * d = dst_bits +
+                    static_cast<uint32_t>(r.left + dst->stride * r.top) * bpp;
             if (dbpr==sbpr && size==sbpr) {
-                size *= h;
+                size *= static_cast<size_t>(h);
                 h = 1;
             }
             do {
@@ -906,5 +1339,84 @@ status_t Surface::unlockAndPost()
     mLockedBuffer = 0;
     return err;
 }
+
+bool Surface::waitForNextFrame(uint64_t lastFrame, nsecs_t timeout) {
+    Mutex::Autolock lock(mMutex);
+    if (mNextFrameNumber > lastFrame) {
+      return true;
+    }
+    return mQueueBufferCondition.waitRelative(mMutex, timeout) == OK;
+}
+
+status_t Surface::getUniqueId(uint64_t* outId) const {
+    Mutex::Autolock lock(mMutex);
+    return mGraphicBufferProducer->getUniqueId(outId);
+}
+
+namespace view {
+
+status_t Surface::writeToParcel(Parcel* parcel) const {
+    return writeToParcel(parcel, false);
+}
+
+status_t Surface::writeToParcel(Parcel* parcel, bool nameAlreadyWritten) const {
+    if (parcel == nullptr) return BAD_VALUE;
+
+    status_t res = OK;
+
+    if (!nameAlreadyWritten) {
+        res = parcel->writeString16(name);
+        if (res != OK) return res;
+
+        /* isSingleBuffered defaults to no */
+        res = parcel->writeInt32(0);
+        if (res != OK) return res;
+    }
+
+    res = parcel->writeStrongBinder(
+            IGraphicBufferProducer::asBinder(graphicBufferProducer));
+
+    return res;
+}
+
+status_t Surface::readFromParcel(const Parcel* parcel) {
+    return readFromParcel(parcel, false);
+}
+
+status_t Surface::readFromParcel(const Parcel* parcel, bool nameAlreadyRead) {
+    if (parcel == nullptr) return BAD_VALUE;
+
+    status_t res = OK;
+    if (!nameAlreadyRead) {
+        name = readMaybeEmptyString16(parcel);
+        // Discard this for now
+        int isSingleBuffered;
+        res = parcel->readInt32(&isSingleBuffered);
+        if (res != OK) {
+            return res;
+        }
+    }
+
+    sp<IBinder> binder;
+
+    res = parcel->readStrongBinder(&binder);
+    if (res != OK) return res;
+
+    graphicBufferProducer = interface_cast<IGraphicBufferProducer>(binder);
+
+    return OK;
+}
+
+String16 Surface::readMaybeEmptyString16(const Parcel* parcel) {
+    size_t len;
+    const char16_t* str = parcel->readString16Inplace(&len);
+    if (str != nullptr) {
+        return String16(str, len);
+    } else {
+        return String16();
+    }
+}
+
+} // namespace view
 
 }; // namespace android

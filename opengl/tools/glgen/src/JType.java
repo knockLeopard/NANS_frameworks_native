@@ -44,7 +44,7 @@ public class JType {
     typeMapping.put(new CType("GLuint"), new JType("int"));
     typeMapping.put(new CType("void"), new JType("void"));
     typeMapping.put(new CType("GLubyte", true, true), new JType("String", false, false));
-    typeMapping.put(new CType("char", false, true), new JType("byte"));
+    typeMapping.put(new CType("char"), new JType("byte"));
     typeMapping.put(new CType("char", true, true), new JType("String", false, false));
     typeMapping.put(new CType("GLchar", true, true), new JType("String", false, false));
     typeMapping.put(new CType("int"), new JType("int"));
@@ -74,6 +74,8 @@ public class JType {
     typeMapping.put(new CType("GLvoid", false, true),
             new JType("java.nio.Buffer", true, false));
     typeMapping.put(new CType("void", false, true),
+            new JType("java.nio.Buffer", true, false));
+    typeMapping.put(new CType("void", true, true),
             new JType("java.nio.Buffer", true, false));
     typeMapping.put(new CType("GLeglImageOES", false, false),
             new JType("java.nio.Buffer", true, false));
@@ -110,6 +112,8 @@ public class JType {
 
     // Typed pointers map to arrays + offsets
     arrayTypeMapping.put(new CType("char", false, true),
+            new JType("byte", false, true));
+    arrayTypeMapping.put(new CType("GLchar", false, true),
             new JType("byte", false, true));
     arrayTypeMapping.put(new CType("GLboolean", false, true),
             new JType("boolean", false, true));
@@ -189,6 +193,84 @@ public class JType {
     public boolean isTypedBuffer() {
     return !baseType.equals("java.nio.Buffer") &&
         (baseType.indexOf("Buffer") != -1);
+    }
+
+    public JType getArrayTypeForTypedBuffer() {
+      if (!isTypedBuffer()) {
+          throw new RuntimeException("Not typed buffer type " + this);
+      }
+      switch (baseType) {
+        case "java.nio.ByteBuffer":
+          return new JType("byte", false, true);
+        case "java.nio.BooleanBuffer":
+          return new JType("boolean", false, true);
+        case "java.nio.ShortBuffer":
+          return new JType("short", false, true);
+        case "java.nio.CharBuffer":
+          return new JType("char", false, true);
+        case "java.nio.IntBuffer":
+          return new JType("int", false, true);
+        case "java.nio.LongBuffer":
+          return new JType("long", false, true);
+        case "java.nio.FloatBuffer":
+          return new JType("float", false, true);
+        case "java.nio.DoubleBuffer":
+          return new JType("double", false, true);
+        default:
+          throw new RuntimeException("Unknown typed buffer type " + this);
+      }
+    }
+
+    public String getArrayGetterForPrimitiveArray() {
+      if (!isArray() || isClass()) {
+          throw new RuntimeException("Not array type " + this);
+      }
+      switch (baseType) {
+        case "byte":
+          return "GetByteArrayElements";
+        case "boolean":
+          return "GetBooleanArrayElements";
+        case "short":
+          return "GetShortArrayElements";
+        case "char":
+          return "GetCharArrayElements";
+        case "int":
+          return "GetIntArrayElements";
+        case "long":
+          return "GetLongArrayElements";
+        case "float":
+          return "GetFloatArrayElements";
+        case "double":
+          return "GetDoubleArrayElements";
+        default:
+          throw new RuntimeException("Unknown array type " + this);
+      }
+    }
+
+    public String getArrayReleaserForPrimitiveArray() {
+      if (!isArray() || isClass()) {
+          throw new RuntimeException("Not array type " + this);
+      }
+      switch (baseType) {
+        case "byte":
+          return "ReleaseByteArrayElements";
+        case "boolean":
+          return "ReleaseBooleanArrayElements";
+        case "short":
+          return "ReleaseShortArrayElements";
+        case "char":
+          return "ReleaseCharArrayElements";
+        case "int":
+          return "ReleaseIntArrayElements";
+        case "long":
+          return "ReleaseLongArrayElements";
+        case "float":
+          return "ReleaseFloatArrayElements";
+        case "double":
+          return "ReleaseDoubleArrayElements";
+        default:
+          throw new RuntimeException("Unknown array type " + this);
+      }
     }
 
     public boolean isEGLHandle() {

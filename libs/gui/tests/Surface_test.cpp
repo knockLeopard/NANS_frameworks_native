@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "DummyConsumer.h"
+
 #include <gtest/gtest.h>
 
 #include <binder/IMemory.h>
@@ -98,6 +100,8 @@ TEST_F(SurfaceTest, ScreenshotsOfProtectedBuffersSucceed) {
     ASSERT_EQ(NO_ERROR, sf->captureScreen(display, producer, Rect(),
             64, 64, 0, 0x7fffffff, false));
 
+    ASSERT_EQ(NO_ERROR, native_window_api_connect(anw.get(),
+            NATIVE_WINDOW_API_CPU));
     // Set the PROTECTED usage bit and verify that the screenshot fails.  Note
     // that we need to dequeue a buffer in order for it to actually get
     // allocated in SurfaceFlinger.
@@ -153,6 +157,105 @@ TEST_F(SurfaceTest, QueryConsumerUsage) {
 
     ASSERT_EQ(NO_ERROR, err);
     ASSERT_EQ(TEST_USAGE_FLAGS, flags);
+}
+
+TEST_F(SurfaceTest, QueryDefaultBuffersDataSpace) {
+    const android_dataspace TEST_DATASPACE = HAL_DATASPACE_SRGB;
+    sp<IGraphicBufferProducer> producer;
+    sp<IGraphicBufferConsumer> consumer;
+    BufferQueue::createBufferQueue(&producer, &consumer);
+    sp<CpuConsumer> cpuConsumer = new CpuConsumer(consumer, 1);
+
+    cpuConsumer->setDefaultBufferDataSpace(TEST_DATASPACE);
+
+    sp<Surface> s = new Surface(producer);
+
+    sp<ANativeWindow> anw(s);
+
+    android_dataspace dataSpace;
+
+    int err = anw->query(anw.get(), NATIVE_WINDOW_DEFAULT_DATASPACE,
+            reinterpret_cast<int*>(&dataSpace));
+
+    ASSERT_EQ(NO_ERROR, err);
+    ASSERT_EQ(TEST_DATASPACE, dataSpace);
+}
+
+TEST_F(SurfaceTest, SettingGenerationNumber) {
+    sp<IGraphicBufferProducer> producer;
+    sp<IGraphicBufferConsumer> consumer;
+    BufferQueue::createBufferQueue(&producer, &consumer);
+    sp<CpuConsumer> cpuConsumer = new CpuConsumer(consumer, 1);
+    sp<Surface> surface = new Surface(producer);
+    sp<ANativeWindow> window(surface);
+
+    // Allocate a buffer with a generation number of 0
+    ANativeWindowBuffer* buffer;
+    int fenceFd;
+    ASSERT_EQ(NO_ERROR, native_window_api_connect(window.get(),
+            NATIVE_WINDOW_API_CPU));
+    ASSERT_EQ(NO_ERROR, window->dequeueBuffer(window.get(), &buffer, &fenceFd));
+    ASSERT_EQ(NO_ERROR, window->cancelBuffer(window.get(), buffer, fenceFd));
+
+    // Detach the buffer and check its generation number
+    sp<GraphicBuffer> graphicBuffer;
+    sp<Fence> fence;
+    ASSERT_EQ(NO_ERROR, surface->detachNextBuffer(&graphicBuffer, &fence));
+    ASSERT_EQ(0U, graphicBuffer->getGenerationNumber());
+
+    ASSERT_EQ(NO_ERROR, surface->setGenerationNumber(1));
+    buffer = static_cast<ANativeWindowBuffer*>(graphicBuffer.get());
+
+    // This should change the generation number of the GraphicBuffer
+    ASSERT_EQ(NO_ERROR, surface->attachBuffer(buffer));
+
+    // Check that the new generation number sticks with the buffer
+    ASSERT_EQ(NO_ERROR, window->cancelBuffer(window.get(), buffer, -1));
+    ASSERT_EQ(NO_ERROR, window->dequeueBuffer(window.get(), &buffer, &fenceFd));
+    graphicBuffer = static_cast<GraphicBuffer*>(buffer);
+    ASSERT_EQ(1U, graphicBuffer->getGenerationNumber());
+}
+
+TEST_F(SurfaceTest, GetConsumerName) {
+    sp<IGraphicBufferProducer> producer;
+    sp<IGraphicBufferConsumer> consumer;
+    BufferQueue::createBufferQueue(&producer, &consumer);
+
+    sp<DummyConsumer> dummyConsumer(new DummyConsumer);
+    consumer->consumerConnect(dummyConsumer, false);
+    consumer->setConsumerName(String8("TestConsumer"));
+
+    sp<Surface> surface = new Surface(producer);
+    sp<ANativeWindow> window(surface);
+    native_window_api_connect(window.get(), NATIVE_WINDOW_API_CPU);
+
+    EXPECT_STREQ("TestConsumer", surface->getConsumerName().string());
+}
+
+TEST_F(SurfaceTest, DynamicSetBufferCount) {
+    sp<IGraphicBufferProducer> producer;
+    sp<IGraphicBufferConsumer> consumer;
+    BufferQueue::createBufferQueue(&producer, &consumer);
+
+    sp<DummyConsumer> dummyConsumer(new DummyConsumer);
+    consumer->consumerConnect(dummyConsumer, false);
+    consumer->setConsumerName(String8("TestConsumer"));
+
+    sp<Surface> surface = new Surface(producer);
+    sp<ANativeWindow> window(surface);
+
+    ASSERT_EQ(NO_ERROR, native_window_api_connect(window.get(),
+            NATIVE_WINDOW_API_CPU));
+    native_window_set_buffer_count(window.get(), 4);
+
+    int fence;
+    ANativeWindowBuffer* buffer;
+    ASSERT_EQ(NO_ERROR, window->dequeueBuffer(window.get(), &buffer, &fence));
+    native_window_set_buffer_count(window.get(), 3);
+    ASSERT_EQ(NO_ERROR, window->queueBuffer(window.get(), buffer, fence));
+    native_window_set_buffer_count(window.get(), 2);
+    ASSERT_EQ(NO_ERROR, window->dequeueBuffer(window.get(), &buffer, &fence));
+    ASSERT_EQ(NO_ERROR, window->queueBuffer(window.get(), buffer, fence));
 }
 
 }

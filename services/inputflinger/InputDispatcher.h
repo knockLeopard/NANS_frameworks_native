@@ -1,6 +1,5 @@
 /*
  * Copyright (C) 2010 The Android Open Source Project
- * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -90,7 +89,7 @@ struct InputTarget {
         /* This flag indicates that the event is being delivered to a foreground application. */
         FLAG_FOREGROUND = 1 << 0,
 
-        /* This flag indicates that the target of a MotionEvent is partly or wholly
+        /* This flag indicates that the MotionEvent falls within the area of the target
          * obscured by another visible window above it.  The motion event should be
          * delivered with flag AMOTION_EVENT_FLAG_WINDOW_IS_OBSCURED. */
         FLAG_WINDOW_IS_OBSCURED = 1 << 1,
@@ -140,6 +139,12 @@ struct InputTarget {
                 | FLAG_DISPATCH_AS_HOVER_EXIT
                 | FLAG_DISPATCH_AS_SLIPPERY_EXIT
                 | FLAG_DISPATCH_AS_SLIPPERY_ENTER,
+
+        /* This flag indicates that the target of a MotionEvent is partly or wholly
+         * obscured by another visible window above it.  The motion event should be
+         * delivered with flag AMOTION_EVENT_FLAG_WINDOW_IS_PARTIALLY_OBSCURED. */
+        FLAG_WINDOW_IS_PARTIALLY_OBSCURED = 1 << 14,
+
     };
 
     // The input channel to be targeted.
@@ -305,15 +310,6 @@ public:
      */
     virtual void setInputWindows(const Vector<sp<InputWindowHandle> >& inputWindowHandles) = 0;
 
-	/**
-	 * Date: Feb 25, 2016
-	 * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
-	 * 
-	 * Add a function declaration.
-	 */
-	virtual void setInputDisplay(int32_t layerStack) = 0;
-	// END
-
     /* Sets the focused application.
      *
      * This method may be called on any thread (usually by the input manager).
@@ -396,15 +392,6 @@ public:
     virtual void setFocusedApplication(const sp<InputApplicationHandle>& inputApplicationHandle);
     virtual void setInputDispatchMode(bool enabled, bool frozen);
     virtual void setInputFilterEnabled(bool enabled);
-
-	/**
-	 * Date: Feb 25, 2016
-	 * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
-	 * 
-	 * Add a virtual function.
-	 */
-	virtual void setInputDisplay(int32_t layerStack);
-	// END
 
     virtual bool transferTouchFocus(const sp<InputChannel>& fromChannel,
             const sp<InputChannel>& toChannel);
@@ -523,6 +510,7 @@ private:
         int32_t deviceId;
         uint32_t source;
         int32_t action;
+        int32_t actionButton;
         int32_t flags;
         int32_t metaState;
         int32_t buttonState;
@@ -537,10 +525,10 @@ private:
 
         MotionEntry(nsecs_t eventTime,
                 int32_t deviceId, uint32_t source, uint32_t policyFlags,
-                int32_t action, int32_t flags,
+                int32_t action, int32_t actionButton, int32_t flags,
                 int32_t metaState, int32_t buttonState, int32_t edgeFlags,
-                float xPrecision, float yPrecision,
-                nsecs_t downTime, int32_t displayId, uint32_t pointerCount,
+                float xPrecision, float yPrecision, nsecs_t downTime,
+                int32_t displayId, uint32_t pointerCount,
                 const PointerProperties* pointerProperties, const PointerCoords* pointerCoords,
                 float xOffset, float yOffset);
         virtual void appendDescription(String8& msg) const;
@@ -625,8 +613,9 @@ private:
     struct Queue {
         T* head;
         T* tail;
+        uint32_t entryCount;
 
-        inline Queue() : head(NULL), tail(NULL) {
+        inline Queue() : head(NULL), tail(NULL), entryCount(0) {
         }
 
         inline bool isEmpty() const {
@@ -634,6 +623,7 @@ private:
         }
 
         inline void enqueueAtTail(T* entry) {
+            entryCount++;
             entry->prev = tail;
             if (tail) {
                 tail->next = entry;
@@ -645,6 +635,7 @@ private:
         }
 
         inline void enqueueAtHead(T* entry) {
+            entryCount++;
             entry->next = head;
             if (head) {
                 head->prev = entry;
@@ -656,6 +647,7 @@ private:
         }
 
         inline void dequeue(T* entry) {
+            entryCount--;
             if (entry->prev) {
                 entry->prev->next = entry->next;
             } else {
@@ -669,6 +661,7 @@ private:
         }
 
         inline T* dequeueAtHead() {
+            entryCount--;
             T* entry = head;
             head = entry->next;
             if (head) {
@@ -679,7 +672,9 @@ private:
             return entry;
         }
 
-        uint32_t count() const;
+        uint32_t count() const {
+            return entryCount;
+        }
     };
 
     /* Specifies which events are to be canceled and why. */
@@ -868,6 +863,8 @@ private:
     Queue<EventEntry> mRecentQueue;
     Queue<CommandEntry> mCommandQueue;
 
+    DropReason mLastDropReason;
+
     void dispatchOnceInnerLocked(nsecs_t* nextWakeupTime);
 
     // Enqueues an inbound event.  Returns true if mLooper->wake() should be called.
@@ -894,16 +891,6 @@ private:
     // Blocked event latency optimization.  Drops old events when the user intends
     // to transfer focus to a new application.
     EventEntry* mNextUnblockedEvent;
-
-	/**
-	 * Date: Feb 25, 2016
-	 * Copyright (C) 2016 RUBIS Laboratory at Seoul National University
-	 * 
-	 * Add declarations of functions and variables.
-	 */
-	bool checkInputDisplay(int displayId);
-	int mWifiDisplay = 0;
-	// END
 
     sp<InputWindowHandle> findTouchedWindowAtLocked(int32_t displayId, int32_t x, int32_t y);
 
@@ -1067,6 +1054,7 @@ private:
             const InjectionState* injectionState);
     bool isWindowObscuredAtPointLocked(const sp<InputWindowHandle>& windowHandle,
             int32_t x, int32_t y) const;
+    bool isWindowObscuredLocked(const sp<InputWindowHandle>& windowHandle) const;
     String8 getApplicationWindowLabelLocked(const sp<InputApplicationHandle>& applicationHandle,
             const sp<InputWindowHandle>& windowHandle);
 
@@ -1095,6 +1083,7 @@ private:
 
     void synthesizeCancelationEventsForAllConnectionsLocked(
             const CancelationOptions& options);
+    void synthesizeCancelationEventsForMonitorsLocked(const CancelationOptions& options);
     void synthesizeCancelationEventsForInputChannelLocked(const sp<InputChannel>& channel,
             const CancelationOptions& options);
     void synthesizeCancelationEventsForConnectionLocked(const sp<Connection>& connection,

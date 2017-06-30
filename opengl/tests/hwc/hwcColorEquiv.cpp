@@ -62,6 +62,8 @@
  *   frame for cases where an equivalent color does not exist.
  */
 
+#define LOG_TAG "hwcColorEquivTest"
+
 #include <algorithm>
 #include <assert.h>
 #include <cerrno>
@@ -87,7 +89,6 @@
 
 #include <ui/GraphicBuffer.h>
 
-#define LOG_TAG "hwcColorEquivTest"
 #include <utils/Log.h>
 #include <testUtil.h>
 
@@ -166,7 +167,6 @@ main(int argc, char *argv[])
     int rv, opt;
     bool error;
     char *chptr;
-    unsigned int pass;
     char cmd[MAXCMD];
     string str;
 
@@ -293,14 +293,12 @@ main(int argc, char *argv[])
     // Use the upper third of the display for the reference frame and
     // the middle third for the equivalence frame.
     unsigned int refHeight = height / 3;
-    unsigned int refPosY = 0; // Reference frame Y position
     unsigned int refPosX = 0; // Reference frame X position
     unsigned int refWidth = width - refPosX;
     if ((refWidth & refFormat->wMod) != 0) {
         refWidth += refFormat->wMod - (refWidth % refFormat->wMod);
     }
     unsigned int equivHeight = height / 3;
-    unsigned int equivPosY = refHeight; // Equivalence frame Y position
     unsigned int equivPosX = 0;         // Equivalence frame X position
     unsigned int equivWidth = width - equivPosX;
     if ((equivWidth & equivFormat->wMod) != 0) {

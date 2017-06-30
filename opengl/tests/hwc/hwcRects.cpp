@@ -80,6 +80,8 @@
  *   a list of attributes and the format of their expected value.
  */
 
+#define LOG_TAG "hwcRectsTest"
+
 #include <algorithm>
 #include <assert.h>
 #include <cerrno>
@@ -105,8 +107,6 @@
 #include <GLES2/gl2ext.h>
 
 #include <ui/GraphicBuffer.h>
-
-#define LOG_TAG "hwcRectsTest"
 #include <utils/Log.h>
 #include <testUtil.h>
 
@@ -204,7 +204,6 @@ main(int argc, char *argv[])
 {
     int     rv, opt;
     char   *chptr;
-    bool    error;
     string  str;
     char cmd[MAXCMD];
 
@@ -367,7 +366,6 @@ static Rectangle parseRect(string rectStr)
     istringstream in(rectStr);
     const struct hwcTestGraphicFormat *format;
     Rectangle rect;
-    struct hwc_rect hwcRect;
 
     // Graphic Format
     in >> str;

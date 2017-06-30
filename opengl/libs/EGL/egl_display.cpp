@@ -15,6 +15,7 @@
  */
 
 #define __STDC_LIMIT_MACROS 1
+#define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
 #include <string.h>
 
@@ -26,6 +27,7 @@
 #include "egl_tls.h"
 #include "Loader.h"
 #include <cutils/properties.h>
+#include <utils/Trace.h>
 
 // ----------------------------------------------------------------------------
 namespace android {
@@ -38,17 +40,16 @@ static char const * const sClientApiString  = "OpenGL_ES";
 extern char const * const gBuiltinExtensionString;
 extern char const * const gExtensionString;
 
-extern void initEglTraceLevel();
-extern void initEglDebugLevel();
 extern void setGLHooksThreadSpecific(gl_hooks_t const *value);
 
 // ----------------------------------------------------------------------------
 
 static bool findExtension(const char* exts, const char* name, size_t nameLen) {
     if (exts) {
-        const char* match = strstr(exts, name);
-        if (match && (match[nameLen] == '\0' || match[nameLen] == ' ')) {
-            return true;
+        for (const char* match = strstr(exts, name); match; match = strstr(match + nameLen, name)) {
+            if (match[nameLen] == '\0' || match[nameLen] == ' ') {
+                return true;
+            }
         }
     }
     return false;
@@ -67,7 +68,10 @@ egl_display_t::~egl_display_t() {
 
 egl_display_t* egl_display_t::get(EGLDisplay dpy) {
     uintptr_t index = uintptr_t(dpy)-1U;
-    return (index >= NUM_DISPLAYS) ? NULL : &sDisplay[index];
+    if (index >= NUM_DISPLAYS || !sDisplay[index].isValid()) {
+        return nullptr;
+    }
+    return &sDisplay[index];
 }
 
 void egl_display_t::addObject(egl_object_t* object) {
@@ -101,6 +105,7 @@ EGLDisplay egl_display_t::getFromNativeDisplay(EGLNativeDisplayType disp) {
 EGLDisplay egl_display_t::getDisplay(EGLNativeDisplayType display) {
 
     Mutex::Autolock _l(lock);
+    ATRACE_CALL();
 
     // get our driver loader
     Loader& loader(Loader::getInstance());
@@ -138,15 +143,6 @@ EGLBoolean egl_display_t::initialize(EGLint *major, EGLint *minor) {
 
     {
         Mutex::Autolock _l(lock);
-
-#if EGL_TRACE
-
-        // Called both at early_init time and at this time. (Early_init is pre-zygote, so
-        // the information from that call may be stale.)
-        initEglTraceLevel();
-        initEglDebugLevel();
-
-#endif
 
         setGLHooksThreadSpecific(&gHooksNoContext);
 
@@ -189,25 +185,21 @@ EGLBoolean egl_display_t::initialize(EGLint *major, EGLint *minor) {
 
         mExtensionString.setTo(gBuiltinExtensionString);
         char const* start = gExtensionString;
-        char const* end;
         do {
-            // find the space separating this extension for the next one
-            end = strchr(start, ' ');
-            if (end) {
-                // length of the extension string
-                const size_t len = end - start;
-                if (len) {
-                    // NOTE: we could avoid the copy if we had strnstr.
-                    const String8 ext(start, len);
-                    if (findExtension(disp.queryString.extensions, ext.string(),
-                            len)) {
-                        mExtensionString.append(start, len+1);
-                    }
+            // length of the extension name
+            size_t len = strcspn(start, " ");
+            if (len) {
+                // NOTE: we could avoid the copy if we had strnstr.
+                const String8 ext(start, len);
+                if (findExtension(disp.queryString.extensions, ext.string(),
+                        len)) {
+                    mExtensionString.append(ext + " ");
                 }
-                // process the next extension string, and skip the space.
-                start = end + 1;
+                // advance to the next extension name, skipping the space.
+                start += len;
+                start += (*start == ' ') ? 1 : 0;
             }
-        } while (end);
+        } while (*start != '\0');
 
         egl_cache_t::get()->initialize(this);
 
@@ -286,7 +278,7 @@ EGLBoolean egl_display_t::terminate() {
         // there are no reference to them, it which case, we're free to
         // delete them.
         size_t count = objects.size();
-        ALOGW_IF(count, "eglTerminate() called w/ %d objects remaining", count);
+        ALOGW_IF(count, "eglTerminate() called w/ %zu objects remaining", count);
         for (size_t i=0 ; i<count ; i++) {
             egl_object_t* o = objects.itemAt(i);
             o->destroy();

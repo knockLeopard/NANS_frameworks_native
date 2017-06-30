@@ -41,7 +41,8 @@ enum {
     CREATE_SURFACE = IBinder::FIRST_CALL_TRANSACTION,
     DESTROY_SURFACE,
     CLEAR_LAYER_FRAME_STATS,
-    GET_LAYER_FRAME_STATS
+    GET_LAYER_FRAME_STATS,
+    GET_TRANSFORM_TO_DISPLAY_INVERSE
 };
 
 class BpSurfaceComposerClient : public BpInterface<ISurfaceComposerClient>
@@ -51,17 +52,19 @@ public:
         : BpInterface<ISurfaceComposerClient>(impl) {
     }
 
-    virtual status_t createSurface(const String8& name, uint32_t w,
-            uint32_t h, PixelFormat format, uint32_t flags,
+    virtual ~BpSurfaceComposerClient();
+
+    virtual status_t createSurface(const String8& name, uint32_t width,
+            uint32_t height, PixelFormat format, uint32_t flags,
             sp<IBinder>* handle,
             sp<IGraphicBufferProducer>* gbp) {
         Parcel data, reply;
         data.writeInterfaceToken(ISurfaceComposerClient::getInterfaceDescriptor());
         data.writeString8(name);
-        data.writeInt32(w);
-        data.writeInt32(h);
-        data.writeInt32(format);
-        data.writeInt32(flags);
+        data.writeUint32(width);
+        data.writeUint32(height);
+        data.writeInt32(static_cast<int32_t>(format));
+        data.writeUint32(flags);
         remote()->transact(CREATE_SURFACE, data, &reply);
         *handle = reply.readStrongBinder();
         *gbp = interface_cast<IGraphicBufferProducer>(reply.readStrongBinder());
@@ -92,7 +95,40 @@ public:
         reply.read(*outStats);
         return reply.readInt32();
     }
+
+    virtual status_t getTransformToDisplayInverse(const sp<IBinder>& handle,
+            bool* outTransformToDisplayInverse) const {
+        Parcel data, reply;
+        status_t result =
+                data.writeInterfaceToken(ISurfaceComposerClient::getInterfaceDescriptor());
+        if (result != NO_ERROR) {
+            return result;
+        }
+        result = data.writeStrongBinder(handle);
+        if (result != NO_ERROR) {
+            return result;
+        }
+        result = remote()->transact(GET_TRANSFORM_TO_DISPLAY_INVERSE, data, &reply);
+        if (result != NO_ERROR) {
+            return result;
+        }
+        int transformInverse;
+        result = reply.readInt32(&transformInverse);
+        if (result != NO_ERROR) {
+            return result;
+        }
+        *outTransformToDisplayInverse = transformInverse != 0 ? true : false;
+        status_t result2 = reply.readInt32(&result);
+        if (result2 != NO_ERROR) {
+            return result2;
+        }
+        return result;
+    }
 };
+
+// Out-of-line virtual method definition to trigger vtable emission in this
+// translation unit (see clang warning -Wweak-vtables)
+BpSurfaceComposerClient::~BpSurfaceComposerClient() {}
 
 IMPLEMENT_META_INTERFACE(SurfaceComposerClient, "android.ui.ISurfaceComposerClient");
 
@@ -105,31 +141,31 @@ status_t BnSurfaceComposerClient::onTransact(
         case CREATE_SURFACE: {
             CHECK_INTERFACE(ISurfaceComposerClient, data, reply);
             String8 name = data.readString8();
-            uint32_t w = data.readInt32();
-            uint32_t h = data.readInt32();
-            PixelFormat format = data.readInt32();
-            uint32_t flags = data.readInt32();
+            uint32_t width = data.readUint32();
+            uint32_t height = data.readUint32();
+            PixelFormat format = static_cast<PixelFormat>(data.readInt32());
+            uint32_t createFlags = data.readUint32();
             sp<IBinder> handle;
             sp<IGraphicBufferProducer> gbp;
-            status_t result = createSurface(name, w, h, format, flags,
-                    &handle, &gbp);
+            status_t result = createSurface(name, width, height, format,
+                    createFlags, &handle, &gbp);
             reply->writeStrongBinder(handle);
-            reply->writeStrongBinder(gbp->asBinder());
+            reply->writeStrongBinder(IInterface::asBinder(gbp));
             reply->writeInt32(result);
             return NO_ERROR;
-        } break;
+        }
         case DESTROY_SURFACE: {
             CHECK_INTERFACE(ISurfaceComposerClient, data, reply);
             reply->writeInt32(destroySurface( data.readStrongBinder() ) );
             return NO_ERROR;
-        } break;
+        }
        case CLEAR_LAYER_FRAME_STATS: {
             CHECK_INTERFACE(ISurfaceComposerClient, data, reply);
             sp<IBinder> handle = data.readStrongBinder();
             status_t result = clearLayerFrameStats(handle);
             reply->writeInt32(result);
             return NO_ERROR;
-        } break;
+        }
         case GET_LAYER_FRAME_STATS: {
             CHECK_INTERFACE(ISurfaceComposerClient, data, reply);
             sp<IBinder> handle = data.readStrongBinder();
@@ -138,7 +174,26 @@ status_t BnSurfaceComposerClient::onTransact(
             reply->write(stats);
             reply->writeInt32(result);
             return NO_ERROR;
-        } break;
+        }
+        case GET_TRANSFORM_TO_DISPLAY_INVERSE: {
+            CHECK_INTERFACE(ISurfaceComposerClient, data, reply);
+            sp<IBinder> handle;
+            status_t result = data.readStrongBinder(&handle);
+            if (result != NO_ERROR) {
+                return result;
+            }
+            bool transformInverse = false;
+            result = getTransformToDisplayInverse(handle, &transformInverse);
+            if (result != NO_ERROR) {
+                return result;
+            }
+            result = reply->writeInt32(transformInverse ? 1 : 0);
+            if (result != NO_ERROR) {
+                return result;
+            }
+            result = reply->writeInt32(NO_ERROR);
+            return result;
+        }
         default:
             return BBinder::onTransact(code, data, reply, flags);
     }

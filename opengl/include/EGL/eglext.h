@@ -176,6 +176,15 @@ typedef EGLBoolean (EGLAPIENTRYP PFNEGLGETSYNCATTRIBKHRPROC) (EGLDisplay dpy, EG
 #define EGL_BITMAP_PIXEL_SIZE_KHR		0x3110
 #endif
 
+#ifndef EGL_KHR_partial_update
+#define EGL_KHR_partial_update 1
+#define EGL_BUFFER_AGE_KHR                0x313D
+typedef EGLBoolean (EGLAPIENTRYP PFNEGLSETDAMAGEREGIONKHRPROC) (EGLDisplay dpy, EGLSurface surface, EGLint *rects, EGLint n_rects);
+#ifdef EGL_EGLEXT_PROTOTYPES
+EGLAPI EGLBoolean EGLAPIENTRY eglSetDamageRegionKHR (EGLDisplay dpy, EGLSurface surface, EGLint *rects, EGLint n_rects);
+#endif
+#endif /* EGL_KHR_partial_update */
+
 #ifndef EGL_NV_coverage_sample
 #define EGL_NV_coverage_sample 1
 #define EGL_COVERAGE_BUFFERS_NV			0x30E0
@@ -435,10 +444,23 @@ typedef EGLBoolean (EGLAPIENTRYP PFNEGLQUERYSTREAMTIMEKHRPROC)(EGLDisplay dpy, E
 #define EGL_OPENGL_ES3_BIT_KHR				    0x00000040
 #endif
 
+#ifndef EGL_KHR_create_context_no_error
+#define EGL_KHR_create_context_no_error 1
+#define EGL_CONTEXT_OPENGL_NO_ERROR_KHR   0x31B3
+#endif /* EGL_KHR_create_context_no_error */
+
 #ifndef EGL_KHR_surfaceless_context
 #define EGL_KHR_surfaceless_context 1
 /* No tokens/entry points, just relaxes an error condition */
 #endif
+
+#ifndef EGL_KHR_swap_buffers_with_damage
+#define EGL_KHR_swap_buffers_with_damage 1
+typedef EGLBoolean (EGLAPIENTRYP PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC) (EGLDisplay dpy, EGLSurface surface, EGLint *rects, EGLint n_rects);
+#ifdef EGL_EGLEXT_PROTOTYPES
+EGLAPI EGLBoolean EGLAPIENTRY eglSwapBuffersWithDamageKHR (EGLDisplay dpy, EGLSurface surface, EGLint *rects, EGLint n_rects);
+#endif
+#endif /* EGL_KHR_swap_buffers_with_damage */
 
 #ifdef EGL_KHR_stream /* Requires KHR_stream extension */
 #ifndef EGL_KHR_stream_cross_process_fd
@@ -573,6 +595,47 @@ typedef khronos_stime_nanoseconds_t EGLnsecsANDROID;
 EGLAPI EGLBoolean eglPresentationTimeANDROID(EGLDisplay dpy, EGLSurface sur, EGLnsecsANDROID time);
 #else
 typedef EGLBoolean (EGLAPIENTRYP PFNEGLPRESENTATIONTIMEANDROID) (EGLDisplay dpy, EGLSurface sur, EGLnsecsANDROID time);
+#endif
+#endif
+
+#ifndef EGL_ANDROID_create_native_client_buffer
+#define EGL_ANDROID_create_native_client_buffer 1
+#define EGL_NATIVE_BUFFER_USAGE_ANDROID   0x3143
+#define EGL_NATIVE_BUFFER_USAGE_PROTECTED_BIT_ANDROID   0x00000001
+#define EGL_NATIVE_BUFFER_USAGE_RENDERBUFFER_BIT_ANDROID   0x00000002
+#define EGL_NATIVE_BUFFER_USAGE_TEXTURE_BIT_ANDROID   0x00000004
+#ifdef EGL_EGLEXT_PROTOTYPES
+EGLAPI EGLClientBuffer eglCreateNativeClientBufferANDROID (const EGLint *attrib_list);
+#else
+typedef EGLAPI EGLClientBuffer (EGLAPIENTRYP PFNEGLCREATENATIVECLIENTBUFFERANDROID) (const EGLint *attrib_list);
+#endif
+#endif
+
+#ifndef EGL_ANDROID_front_buffer_auto_refresh
+#define EGL_ANDROID_front_buffer_auto_refresh 1
+#define EGL_FRONT_BUFFER_AUTO_REFRESH_ANDROID 0x314C
+#endif
+
+#ifndef EGL_KHR_mutable_render_buffer
+#define EGL_KHR_mutable_render_buffer 1
+#define EGL_MUTABLE_RENDER_BUFFER_BIT_KHR 0x1000
+#endif
+
+#ifndef EGL_ANDROID_get_frame_timestamps
+#define EGL_ANDROID_get_frame_timestamps 1
+#define EGL_TIMESTAMPS_ANDROID 0x314D
+#define EGL_QUEUE_TIME_ANDROID 0x314E
+#define EGL_RENDERING_COMPLETE_TIME_ANDROID 0x314F
+#define EGL_COMPOSITION_START_TIME_ANDROID 0x3430
+#define EGL_COMPOSITION_FINISHED_TIME_ANDROID 0x3431
+#define EGL_DISPLAY_RETIRE_TIME_ANDROID 0x3432
+#define EGL_READS_DONE_TIME_ANDROID 0x3433
+#ifdef EGL_EGLEXT_PROTOTYPES
+EGLAPI EGLBoolean eglGetFrameTimestampsANDROID(EGLDisplay dpy, EGLSurface surface, EGLint framesAgo, EGLint numTimestamps, const EGLint *timestamps, EGLnsecsANDROID *values);
+EGLAPI EGLBoolean eglQueryTimestampSupportedANDROID(EGLDisplay dpy, EGLSurface surface, EGLint timestamp);
+#else
+typedef EGLAPI EGLBoolean (EGLAPIENTRYP PFNEGLGETFRAMETIMESTAMPSANDROID) (EGLDisplay dpy, EGLSurface surface, EGLint framesAgo, EGLint numTimestamps, const EGLint *timestamps, EGLnsecsANDROID *values);
+typedef EGLAPI EGLBoolean (EGLAPIENTRYP PFNEGLQUERYTIMESTAMPSUPPORTEDANDROID) (EGLDisplay dpy, EGLSurface surface, EGLint timestamp);
 #endif
 #endif
 

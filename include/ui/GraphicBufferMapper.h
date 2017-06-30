@@ -20,12 +20,9 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include <ui/Gralloc1.h>
+
 #include <utils/Singleton.h>
-
-#include <hardware/gralloc.h>
-
-
-struct gralloc_module_t;
 
 namespace android {
 
@@ -39,32 +36,34 @@ public:
     static inline GraphicBufferMapper& get() { return getInstance(); }
 
     status_t registerBuffer(buffer_handle_t handle);
+    status_t registerBuffer(const GraphicBuffer* buffer);
 
     status_t unregisterBuffer(buffer_handle_t handle);
-    
+
     status_t lock(buffer_handle_t handle,
-            int usage, const Rect& bounds, void** vaddr);
+            uint32_t usage, const Rect& bounds, void** vaddr);
 
     status_t lockYCbCr(buffer_handle_t handle,
-            int usage, const Rect& bounds, android_ycbcr *ycbcr);
+            uint32_t usage, const Rect& bounds, android_ycbcr *ycbcr);
 
     status_t unlock(buffer_handle_t handle);
 
     status_t lockAsync(buffer_handle_t handle,
-            int usage, const Rect& bounds, void** vaddr, int fenceFd);
+            uint32_t usage, const Rect& bounds, void** vaddr, int fenceFd);
 
     status_t lockAsyncYCbCr(buffer_handle_t handle,
-            int usage, const Rect& bounds, android_ycbcr *ycbcr, int fenceFd);
+            uint32_t usage, const Rect& bounds, android_ycbcr *ycbcr,
+            int fenceFd);
 
     status_t unlockAsync(buffer_handle_t handle, int *fenceFd);
-    
-    // dumps information about the mapping of this handle
-    void dump(buffer_handle_t handle);
 
 private:
     friend class Singleton<GraphicBufferMapper>;
+
     GraphicBufferMapper();
-    gralloc_module_t const *mAllocMod;
+
+    std::unique_ptr<Gralloc1::Loader> mLoader;
+    std::unique_ptr<Gralloc1::Device> mDevice;
 };
 
 // ---------------------------------------------------------------------------

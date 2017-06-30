@@ -25,7 +25,9 @@
 #include <utils/Timers.h>
 
 #include <binder/IInterface.h>
+#include <ui/PixelFormat.h>
 #include <ui/Rect.h>
+#include <gui/OccupancyTracker.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -33,6 +35,7 @@
 namespace android {
 // ----------------------------------------------------------------------------
 
+class BufferItem;
 class Fence;
 class GraphicBuffer;
 class IConsumerListener;
@@ -41,71 +44,6 @@ class NativeHandle;
 class IGraphicBufferConsumer : public IInterface {
 
 public:
-
-    // public facing structure for BufferSlot
-    class BufferItem : public Flattenable<BufferItem> {
-        friend class Flattenable<BufferItem>;
-        size_t getPodSize() const;
-        size_t getFlattenedSize() const;
-        size_t getFdCount() const;
-        status_t flatten(void*& buffer, size_t& size, int*& fds, size_t& count) const;
-        status_t unflatten(void const*& buffer, size_t& size, int const*& fds, size_t& count);
-
-    public:
-        // The default value of mBuf, used to indicate this doesn't correspond to a slot.
-        enum { INVALID_BUFFER_SLOT = -1 };
-        BufferItem();
-
-        // mGraphicBuffer points to the buffer allocated for this slot, or is NULL
-        // if the buffer in this slot has been acquired in the past (see
-        // BufferSlot.mAcquireCalled).
-        sp<GraphicBuffer> mGraphicBuffer;
-
-        // mFence is a fence that will signal when the buffer is idle.
-        sp<Fence> mFence;
-
-        // mCrop is the current crop rectangle for this buffer slot.
-        Rect mCrop;
-
-        // mTransform is the current transform flags for this buffer slot.
-        // refer to NATIVE_WINDOW_TRANSFORM_* in <window.h>
-        uint32_t mTransform;
-
-        // mScalingMode is the current scaling mode for this buffer slot.
-        // refer to NATIVE_WINDOW_SCALING_* in <window.h>
-        uint32_t mScalingMode;
-
-        // mTimestamp is the current timestamp for this buffer slot. This gets
-        // to set by queueBuffer each time this slot is queued. This value
-        // is guaranteed to be monotonically increasing for each newly
-        // acquired buffer.
-        int64_t mTimestamp;
-
-        // mIsAutoTimestamp indicates whether mTimestamp was generated
-        // automatically when the buffer was queued.
-        bool mIsAutoTimestamp;
-
-        // mFrameNumber is the number of the queued frame for this slot.
-        uint64_t mFrameNumber;
-
-        // mBuf is the slot index of this buffer (default INVALID_BUFFER_SLOT).
-        int mBuf;
-
-        // mIsDroppable whether this buffer was queued with the
-        // property that it can be replaced by a new buffer for the purpose of
-        // making sure dequeueBuffer() won't block.
-        // i.e.: was the BufferQueue in "mDequeueBufferCannotBlock" when this buffer
-        // was queued.
-        bool mIsDroppable;
-
-        // Indicates whether this buffer has been seen by a consumer yet
-        bool mAcquireCalled;
-
-        // Indicates this buffer must be transformed by the inverse transform of the screen
-        // it is displayed onto. This is applied after mTransform.
-        bool mTransformToDisplayInverse;
-    };
-
     enum {
         // Returned by releaseBuffer, after which the consumer must
         // free any references to the just-released buffer that it might have.
@@ -132,6 +70,12 @@ public:
     // returned.  The presentation time is in nanoseconds, and the time base
     // is CLOCK_MONOTONIC.
     //
+    // If maxFrameNumber is non-zero, it indicates that acquireBuffer should
+    // only return a buffer with a frame number less than or equal to
+    // maxFrameNumber. If no such frame is available (such as when a buffer has
+    // been replaced but the consumer has not received the onFrameReplaced
+    // callback), then PRESENT_LATER will be returned.
+    //
     // Return of NO_ERROR means the operation completed as normal.
     //
     // Return of a positive value means the operation could not be completed
@@ -141,7 +85,8 @@ public:
     //
     // Return of a negative value means an error has occurred:
     // * INVALID_OPERATION - too many buffers have been acquired
-    virtual status_t acquireBuffer(BufferItem* buffer, nsecs_t presentWhen) = 0;
+    virtual status_t acquireBuffer(BufferItem* buffer, nsecs_t presentWhen,
+            uint64_t maxFrameNumber = 0) = 0;
 
     // detachBuffer attempts to remove all ownership of the buffer in the given
     // slot from the buffer queue. If this call succeeds, the slot will be
@@ -166,7 +111,8 @@ public:
     // will be deallocated as stale.
     //
     // Return of a value other than NO_ERROR means an error has occurred:
-    // * BAD_VALUE - outSlot or buffer were NULL
+    // * BAD_VALUE - outSlot or buffer were NULL, or the generation number of
+    //               the buffer did not match the buffer queue.
     // * INVALID_OPERATION - cannot attach the buffer because it would cause too
     //                       many buffers to be acquired.
     // * NO_MEMORY - no free slots available
@@ -243,35 +189,44 @@ public:
     // * BAD_VALUE - either w or h was zero
     virtual status_t setDefaultBufferSize(uint32_t w, uint32_t h) = 0;
 
-    // setDefaultMaxBufferCount sets the default value for the maximum buffer
-    // count (the initial default is 2). If the producer has requested a
-    // buffer count using setBufferCount, the default buffer count will only
-    // take effect if the producer sets the count back to zero.
+    // setMaxBufferCount sets the maximum value for the number of buffers used
+    // in the buffer queue (the initial default is NUM_BUFFER_SLOTS). If a call
+    // to setMaxAcquiredBufferCount (by the consumer), or a call to setAsyncMode
+    // or setMaxDequeuedBufferCount (by the producer), would cause this value to
+    // be exceeded then that call will fail. This call will fail if a producer
+    // is connected to the BufferQueue.
     //
-    // The count must be between 2 and NUM_BUFFER_SLOTS, inclusive.
-    //
-    // Return of a value other than NO_ERROR means an error has occurred:
-    // * BAD_VALUE - bufferCount was out of range (see above).
-    virtual status_t setDefaultMaxBufferCount(int bufferCount) = 0;
-
-    // disableAsyncBuffer disables the extra buffer used in async mode
-    // (when both producer and consumer have set their "isControlledByApp"
-    // flag) and has dequeueBuffer() return WOULD_BLOCK instead.
-    //
-    // This can only be called before consumerConnect().
+    // The count must be between 1 and NUM_BUFFER_SLOTS, inclusive. The count
+    // cannot be less than maxAcquiredBufferCount.
     //
     // Return of a value other than NO_ERROR means an error has occurred:
-    // * INVALID_OPERATION - attempting to call this after consumerConnect.
-    virtual status_t disableAsyncBuffer() = 0;
+    // * BAD_VALUE - one of the below conditions occurred:
+    //             * bufferCount was out of range (see above).
+    //             * failure to adjust the number of available slots.
+    // * INVALID_OPERATION - attempting to call this after a producer connected.
+    virtual status_t setMaxBufferCount(int bufferCount) = 0;
 
     // setMaxAcquiredBufferCount sets the maximum number of buffers that can
-    // be acquired by the consumer at one time (default 1).  This call will
-    // fail if a producer is connected to the BufferQueue.
+    // be acquired by the consumer at one time (default 1). If this method
+    // succeeds, any new buffer slots will be both unallocated and owned by the
+    // BufferQueue object (i.e. they are not owned by the producer or consumer).
+    // Calling this may also cause some buffer slots to be emptied.
     //
-    // maxAcquiredBuffers must be (inclusive) between 1 and MAX_MAX_ACQUIRED_BUFFERS.
+    // This function should not be called with a value of maxAcquiredBuffers
+    // that is less than the number of currently acquired buffer slots. Doing so
+    // will result in a BAD_VALUE error.
+    //
+    // maxAcquiredBuffers must be (inclusive) between 1 and
+    // MAX_MAX_ACQUIRED_BUFFERS. It also cannot cause the maxBufferCount value
+    // to be exceeded.
     //
     // Return of a value other than NO_ERROR means an error has occurred:
-    // * BAD_VALUE - maxAcquiredBuffers was out of range (see above).
+    // * NO_INIT - the buffer queue has been abandoned
+    // * BAD_VALUE - one of the below conditions occurred:
+    //             * maxAcquiredBuffers was out of range (see above).
+    //             * failure to adjust the number of available slots.
+    //             * client would have more than the requested number of
+    //               acquired buffers after this call
     // * INVALID_OPERATION - attempting to call this after a producer connected.
     virtual status_t setMaxAcquiredBufferCount(int maxAcquiredBuffers) = 0;
 
@@ -280,11 +235,19 @@ public:
 
     // setDefaultBufferFormat allows the BufferQueue to create
     // GraphicBuffers of a defaultFormat if no format is specified
-    // in dequeueBuffer.  Formats are enumerated in graphics.h; the
-    // initial default is HAL_PIXEL_FORMAT_RGBA_8888.
+    // in dequeueBuffer.
+    // The initial default is PIXEL_FORMAT_RGBA_8888.
     //
     // Return of a value other than NO_ERROR means an unknown error has occurred.
-    virtual status_t setDefaultBufferFormat(uint32_t defaultFormat) = 0;
+    virtual status_t setDefaultBufferFormat(PixelFormat defaultFormat) = 0;
+
+    // setDefaultBufferDataSpace is a request to the producer to provide buffers
+    // of the indicated dataSpace. The producer may ignore this request.
+    // The initial default is HAL_DATASPACE_UNKNOWN.
+    //
+    // Return of a value other than NO_ERROR means an unknown error has occurred.
+    virtual status_t setDefaultBufferDataSpace(
+            android_dataspace defaultDataSpace) = 0;
 
     // setConsumerUsageBits will turn on additional usage bits for dequeueBuffer.
     // These are merged with the bits passed to dequeueBuffer.  The values are
@@ -302,6 +265,17 @@ public:
 
     // Retrieve the sideband buffer stream, if any.
     virtual sp<NativeHandle> getSidebandStream() const = 0;
+
+    // Retrieves any stored segments of the occupancy history of this
+    // BufferQueue and clears them. Optionally closes out the pending segment if
+    // forceFlush is true.
+    virtual status_t getOccupancyHistory(bool forceFlush,
+            std::vector<OccupancyTracker::Segment>* outHistory) = 0;
+
+    // discardFreeBuffers releases all currently-free buffers held by the queue,
+    // in order to reduce the memory consumption of the queue to the minimum
+    // possible without discarding data.
+    virtual status_t discardFreeBuffers() = 0;
 
     // dump state into a string
     virtual void dump(String8& result, const char* prefix) const = 0;

@@ -29,8 +29,11 @@ TEST_F(SurfaceTextureGLToGLTest, TransformHintGetsRespected) {
     mST->setTransformHint(NATIVE_WINDOW_TRANSFORM_ROT_90);
 
     // This test requires 3 buffers to avoid deadlock because we're
-    // both producer and consumer, and only using one thread.
-    mST->setDefaultMaxBufferCount(3);
+    // both producer and consumer, and only using one thread. Set max dequeued
+    // to 2, and max acquired already defaults to 1.
+    ASSERT_EQ(OK, mSTC->setMaxDequeuedBufferCount(2));
+
+    SetUpWindowAndContext();
 
     // Do the producer side of things
     EXPECT_TRUE(eglMakeCurrent(mEglDisplay, mProducerEglSurface,
@@ -81,7 +84,10 @@ TEST_F(SurfaceTextureGLToGLTest, TexturingFromGLFilledRGBABufferPow2) {
     mST->setDefaultBufferSize(texWidth, texHeight);
 
     // This test requires 3 buffers to complete run on a single thread.
-    mST->setDefaultMaxBufferCount(3);
+    // Set max dequeued to 2, and max acquired already defaults to 1.
+    ASSERT_EQ(OK, mSTC->setMaxDequeuedBufferCount(2));
+
+    SetUpWindowAndContext();
 
     // Do the producer side of things
     EXPECT_TRUE(eglMakeCurrent(mEglDisplay, mProducerEglSurface,
@@ -150,6 +156,7 @@ TEST_F(SurfaceTextureGLToGLTest, TexturingFromGLFilledRGBABufferPow2) {
 }
 
 TEST_F(SurfaceTextureGLToGLTest, EglDestroySurfaceUnrefsBuffers) {
+    SetUpWindowAndContext();
     sp<GraphicBuffer> buffers[2];
 
     // This test requires async mode to run on a single thread.
@@ -188,13 +195,14 @@ TEST_F(SurfaceTextureGLToGLTest, EglDestroySurfaceUnrefsBuffers) {
     // This test should have the only reference to buffer 0.
     EXPECT_EQ(1, buffers[0]->getStrongCount());
 
-    // The GLConsumer should hold a single reference to buffer 1 in its
-    // mCurrentBuffer member.  All of the references in the slots should have
-    // been released.
-    EXPECT_EQ(2, buffers[1]->getStrongCount());
+    // The GLConsumer should hold one reference to buffer 1 in its
+    // mCurrentTextureImage member and another reference in mEglSlots. The third
+    // reference is in this test.
+    EXPECT_EQ(3, buffers[1]->getStrongCount());
 }
 
 TEST_F(SurfaceTextureGLToGLTest, EglDestroySurfaceAfterAbandonUnrefsBuffers) {
+    SetUpWindowAndContext();
     sp<GraphicBuffer> buffers[3];
 
     // This test requires async mode to run on a single thread.
@@ -235,18 +243,24 @@ TEST_F(SurfaceTextureGLToGLTest, EglDestroySurfaceAfterAbandonUnrefsBuffers) {
     ASSERT_EQ(EGL_SUCCESS, eglGetError());
     mProducerEglSurface = EGL_NO_SURFACE;
 
-    EXPECT_EQ(1, buffers[0]->getStrongCount());
     EXPECT_EQ(1, buffers[1]->getStrongCount());
 
     // Depending on how lazily the GL driver dequeues buffers, we may end up
-    // with either two or three total buffers.  If there are three, make sure
-    // the last one was properly down-ref'd.
+    // with either two or three total buffers.  If there are three, each entry
+    // of the buffers array will be unique and there should only be one
+    // reference (the one in this test). If there are two the first and last
+    // element in the array will be equal meaning that buffer representing both
+    // 0 and 2 will have two references (one for 0 and one for 2).
     if (buffers[2] != buffers[0]) {
+        EXPECT_EQ(1, buffers[0]->getStrongCount());
         EXPECT_EQ(1, buffers[2]->getStrongCount());
+    } else {
+        EXPECT_EQ(2, buffers[0]->getStrongCount());
     }
 }
 
 TEST_F(SurfaceTextureGLToGLTest, EglMakeCurrentBeforeConsumerDeathUnrefsBuffers) {
+    SetUpWindowAndContext();
     sp<GraphicBuffer> buffer;
 
     EXPECT_TRUE(eglMakeCurrent(mEglDisplay, mProducerEglSurface,
@@ -284,6 +298,7 @@ TEST_F(SurfaceTextureGLToGLTest, EglMakeCurrentBeforeConsumerDeathUnrefsBuffers)
 }
 
 TEST_F(SurfaceTextureGLToGLTest, EglMakeCurrentAfterConsumerDeathUnrefsBuffers) {
+    SetUpWindowAndContext();
     sp<GraphicBuffer> buffer;
 
     EXPECT_TRUE(eglMakeCurrent(mEglDisplay, mProducerEglSurface,
@@ -325,7 +340,10 @@ TEST_F(SurfaceTextureGLToGLTest, TexturingFromUserSizedGLFilledBuffer) {
     enum { texHeight = 64 };
 
     // This test requires 3 buffers to complete run on a single thread.
-    mST->setDefaultMaxBufferCount(3);
+    // Set max dequeued to 2, and max acquired already defaults to 1.
+    ASSERT_EQ(OK, mSTC->setMaxDequeuedBufferCount(2));
+
+    SetUpWindowAndContext();
 
     // Set the user buffer size.
     native_window_set_buffers_user_dimensions(mANW.get(), texWidth, texHeight);
@@ -382,7 +400,10 @@ TEST_F(SurfaceTextureGLToGLTest, TexturingFromPreRotatedUserSizedGLFilledBuffer)
     enum { texHeight = 16 };
 
     // This test requires 3 buffers to complete run on a single thread.
-    mST->setDefaultMaxBufferCount(3);
+    // Set max dequeued to 2, and max acquired already defaults to 1.
+    ASSERT_EQ(OK, mSTC->setMaxDequeuedBufferCount(2));
+
+    SetUpWindowAndContext();
 
     // Set the transform hint.
     mST->setTransformHint(NATIVE_WINDOW_TRANSFORM_ROT_90);
@@ -443,7 +464,10 @@ TEST_F(SurfaceTextureGLToGLTest, TexturingFromPreRotatedGLFilledBuffer) {
     enum { texHeight = 16 };
 
     // This test requires 3 buffers to complete run on a single thread.
-    mST->setDefaultMaxBufferCount(3);
+    // Set max dequeued to 2, and max acquired already defaults to 1.
+    ASSERT_EQ(OK, mSTC->setMaxDequeuedBufferCount(2));
+
+    SetUpWindowAndContext();
 
     // Set the transform hint.
     mST->setTransformHint(NATIVE_WINDOW_TRANSFORM_ROT_90);

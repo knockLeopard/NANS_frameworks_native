@@ -23,6 +23,7 @@
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
 #include <utils/Timers.h>
+#include <utils/String16.h>
 
 #include <gui/BitTube.h>
 
@@ -52,7 +53,19 @@ public:
 
     enum { MAX_RECEIVE_BUFFER_EVENT_COUNT = 256 };
 
-            SensorEventQueue(const sp<ISensorEventConnection>& connection);
+    /**
+     * Typical sensor delay (sample period) in microseconds.
+     */
+    // Fastest sampling, system will bound it to minDelay
+    static constexpr int32_t SENSOR_DELAY_FASTEST = 0;
+    // Typical sample period for game, 50Hz;
+    static constexpr int32_t SENSOR_DELAY_GAME = 20000;
+    // Typical sample period for UI, 15Hz
+    static constexpr int32_t SENSOR_DELAY_UI = 66667;
+    // Default sensor sample period
+    static constexpr int32_t SENSOR_DELAY_NORMAL = 200000;
+
+    SensorEventQueue(const sp<ISensorEventConnection>& connection);
     virtual ~SensorEventQueue();
     virtual void onFirstRef();
 
@@ -67,6 +80,7 @@ public:
     status_t wake() const;
 
     status_t enableSensor(Sensor const* sensor) const;
+    status_t enableSensor(Sensor const* sensor, int32_t samplingPeriodUs) const;
     status_t disableSensor(Sensor const* sensor) const;
     status_t setEventRate(Sensor const* sensor, nsecs_t ns) const;
 
@@ -77,6 +91,8 @@ public:
     status_t flush() const;
     // Send an ack for every wake_up sensor event that is set to WAKE_UP_SENSOR_EVENT_NEEDS_ACK.
     void sendAck(const ASensorEvent* events, int count);
+
+    status_t injectSensorEvent(const ASensorEvent& event);
 private:
     sp<Looper> getLooper() const;
     sp<ISensorEventConnection> mSensorEventConnection;

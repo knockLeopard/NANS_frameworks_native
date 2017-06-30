@@ -222,12 +222,13 @@ public class JniCodeEmitter {
         needsExit = true;
     }
 
-    boolean isNullAllowed(CFunc cfunc) {
+    boolean isNullAllowed(CFunc cfunc, String cname) {
         String[] checks = mChecker.getChecks(cfunc.getName());
         int index = 1;
         if (checks != null) {
             while (index < checks.length) {
-                if (checks[index].equals("nullAllowed")) {
+                if (checks[index].equals("nullAllowed") &&
+                    checks[index + 1].equals(cname)) {
                     return true;
                 } else {
                     index = skipOneCheck(checks, index);
@@ -243,6 +244,22 @@ public class JniCodeEmitter {
         if (checks != null) {
             while (index < checks.length) {
                 if (checks[index].startsWith("check")) {
+                    return true;
+                } else {
+                    index = skipOneCheck(checks, index);
+                }
+            }
+        }
+        return false;
+    }
+
+    boolean hasCheckTest(CFunc cfunc, String cname) {
+        String[] checks = mChecker.getChecks(cfunc.getName());
+        int index = 1;
+        if (checks != null) {
+            while (index < checks.length) {
+                if (checks[index].startsWith("check") &&
+                    cname != null && cname.equals(checks[index + 1])) {
                     return true;
                 } else {
                     index = skipOneCheck(checks, index);
@@ -281,7 +298,7 @@ public class JniCodeEmitter {
         } else if (checks[index].equals("requires")) {
             index += 2;
         } else if (checks[index].equals("nullAllowed")) {
-            index += 1;
+            index += 2;
         } else {
             System.out.println("Error: unknown keyword \"" +
                                checks[index] + "\"");
@@ -462,6 +479,37 @@ public class JniCodeEmitter {
 
                     needsExit = true;
                     index += 3;
+                } else {
+                    index = skipOneCheck(checks, index);
+                }
+            }
+        }
+    }
+
+    void emitStringCheck(CFunc cfunc, String cname, PrintStream out, String iii) {
+
+        String[] checks = mChecker.getChecks(cfunc.getName());
+
+        int index = 1;
+        if (checks != null) {
+            while (index < checks.length) {
+                if (checks[index].startsWith("check")) {
+                    if (cname != null && !cname.equals(checks[index + 1])) {
+                    index += 3;
+                    continue;
+                }
+                    out.println(iii + "_stringlen = _env->GetStringUTFLength(" + cname + ");");
+                    out.println(iii + "if (" + checks[index + 2] + " > _stringlen) {");
+                    out.println(iii + indent + "_exception = 1;");
+                    out.println(iii + indent +
+                            "_exceptionType = \"java/lang/ArrayIndexOutOfBoundsException\";");
+                    out.println(iii + indent +
+                            "_exceptionMessage = \"length of " + cname + " is shorter than " +
+                            checks[index + 2] + " argument\";");
+                    out.println(iii + indent + "goto exit;");
+                    out.println(iii + "}");
+                    index += 3;
+                    needsExit = true;
                 } else {
                     index = skipOneCheck(checks, index);
                 }
@@ -673,7 +721,7 @@ public class JniCodeEmitter {
                         "\";");
         cStream.println();
 
-        cStream.println("static JNINativeMethod methods[] = {");
+        cStream.println("static const JNINativeMethod methods[] = {");
 
         cStream.println("{\"_nativeClassInit\", \"()V\", (void*)nativeClassInit },");
 
@@ -812,6 +860,7 @@ public class JniCodeEmitter {
         List<Integer> stringArgs = new ArrayList<Integer>();
         int numBufferArgs = 0;
         List<String> bufferArgNames = new ArrayList<String>();
+        List<JType> bufferArgTypes = new ArrayList<JType>();
 
         // Emit JNI signature (arguments)
         //
@@ -835,6 +884,7 @@ public class JniCodeEmitter {
                     int cIndex = jfunc.getArgCIndex(i);
                     String cname = cfunc.getArgName(cIndex);
                     bufferArgNames.add(cname);
+                    bufferArgTypes.add(jfunc.getArgType(i));
                     numBufferArgs++;
                 }
             }
@@ -948,12 +998,25 @@ public class JniCodeEmitter {
 
         // Emit a single _array or multiple _XXXArray variables
         if (numBufferArgs == 1) {
+            JType bufferType = bufferArgTypes.get(0);
+            if (bufferType.isTypedBuffer()) {
+                String typedArrayType = getJniType(bufferType.getArrayTypeForTypedBuffer());
+                out.println(indent + typedArrayType + " _array = (" + typedArrayType + ") 0;");
+            } else {
                 out.println(indent + "jarray _array = (jarray) 0;");
-                out.println(indent + "jint _bufferOffset = (jint) 0;");
+            }
+            out.println(indent + "jint _bufferOffset = (jint) 0;");
         } else {
             for (int i = 0; i < numBufferArgs; i++) {
-                out.println(indent + "jarray _" + bufferArgNames.get(i) +
-                            "Array = (jarray) 0;");
+                JType bufferType = bufferArgTypes.get(0);
+                if (bufferType.isTypedBuffer()) {
+                    String typedArrayType = getJniType(bufferType.getArrayTypeForTypedBuffer());
+                    out.println(indent + typedArrayType + " _" + bufferArgNames.get(i) +
+                                "Array = (" + typedArrayType + ") 0;");
+                } else {
+                    out.println(indent + "jarray _" + bufferArgNames.get(i) +
+                                "Array = (jarray) 0;");
+                }
                 out.println(indent + "jint _" + bufferArgNames.get(i) +
                             "BufferOffset = (jint) 0;");
             }
@@ -1051,12 +1114,20 @@ public class JniCodeEmitter {
 
         // Emit local variable declaration for strings
         if (stringArgs.size() > 0) {
+            boolean requiresStringLengthCheck = false;
             for (int i = 0; i < stringArgs.size(); i++) {
                 int idx = stringArgs.get(i).intValue();
                 int cIndex = jfunc.getArgCIndex(idx);
                 String cname = cfunc.getArgName(cIndex);
 
                 out.println(indent + "const char* _native" + cname + " = 0;");
+                if (hasCheckTest(cfunc, cname)) {
+                    requiresStringLengthCheck = true;
+                }
+            }
+
+            if (requiresStringLengthCheck) {
+                out.println(indent + "jsize _stringlen = 0;");
             }
 
             out.println();
@@ -1069,19 +1140,34 @@ public class JniCodeEmitter {
                 int cIndex = jfunc.getArgCIndex(idx);
                 String cname = cfunc.getArgName(cIndex);
 
+                boolean nullAllowed = isNullAllowed(cfunc, cname);
+                String nullAllowedIndent = nullAllowed ? indent : "";
+
                 CType type = cfunc.getArgType(jfunc.getArgCIndex(idx));
                 String decl = type.getDeclaration();
-                needsExit = true;
-                out.println(indent + "if (!" + cname + ") {");
-                out.println(indent + indent + "_exception = 1;");
-                out.println(indent + indent +
-                            "_exceptionType = \"java/lang/IllegalArgumentException\";");
-                out.println(indent + indent +
-                            "_exceptionMessage = \"" + cname + " == null\";");
-                out.println(indent + indent + "goto exit;");
-                out.println(indent + "}");
 
-                out.println(indent + "_native" + cname + " = _env->GetStringUTFChars(" + cname + ", 0);");
+                if (nullAllowed) {
+                    out.println(indent + "if (" + cname + ") {");
+                } else {
+                    needsExit = true;
+                    out.println(indent + "if (!" + cname + ") {");
+                    out.println(indent + indent + "_exception = 1;");
+                    out.println(indent + indent +
+                            "_exceptionType = \"java/lang/IllegalArgumentException\";");
+                    out.println(indent + indent +
+                            "_exceptionMessage = \"" + cname + " == null\";");
+                    out.println(indent + indent + "goto exit;");
+                    out.println(indent + "}");
+                }
+
+                out.println(nullAllowedIndent + indent + "_native" + cname +
+                        " = _env->GetStringUTFChars(" + cname + ", 0);");
+
+                emitStringCheck(cfunc, cname, out, nullAllowedIndent + indent);
+
+                if (nullAllowed) {
+                    out.println(indent + "}");
+                }
             }
 
             out.println();
@@ -1100,84 +1186,126 @@ public class JniCodeEmitter {
                 remaining = ((numArrays + numBuffers) <= 1) ? "_remaining" :
                     "_" + cname + "Remaining";
 
+                boolean nullAllowed = isNullAllowed(cfunc, cname);
+                String nullAllowedIndent = nullAllowed ? indent : "";
+
                 if (jfunc.getArgType(idx).isArray()
                        && !jfunc.getArgType(idx).isEGLHandle()) {
                     needsExit = true;
-                    out.println(indent + "if (!" + cname + "_ref) {");
-                    out.println(indent + indent + "_exception = 1;");
-                    out.println(indent + indent +
-                                "_exceptionType = \"java/lang/IllegalArgumentException\";");
-                    out.println(indent + indent +
-                                "_exceptionMessage = \"" + cname +" == null\";");
-                    out.println(indent + indent + "goto exit;");
-                    out.println(indent + "}");
-                    out.println(indent + "if (" + offset + " < 0) {");
-                    out.println(indent + indent + "_exception = 1;");
-                    out.println(indent + indent +
-                                "_exceptionType = \"java/lang/IllegalArgumentException\";");
-                    out.println(indent + indent +
-                                "_exceptionMessage = \"" + offset +" < 0\";");
-                    out.println(indent + indent + "goto exit;");
-                    out.println(indent + "}");
 
-                    out.println(indent + remaining + " = " +
-                                    (mUseCPlusPlus ? "_env" : "(*_env)") +
-                                    "->GetArrayLength(" +
-                                    (mUseCPlusPlus ? "" : "_env, ") +
-                                    cname + "_ref) - " + offset + ";");
+                    if (nullAllowed) {
+                        out.println(indent + "if (" + cname + "_ref) {");
+                    }
+                    else
+                    {
+                        out.println(indent + "if (!" + cname + "_ref) {");
+                        out.println(indent + indent + "_exception = 1;");
+                        out.println(indent + indent +
+                                "_exceptionType = " +
+                                "\"java/lang/IllegalArgumentException\";");
+                        out.println(indent + indent +
+                                "_exceptionMessage = \"" + cname +
+                                " == null\";");
+                        out.println(indent + indent + "goto exit;");
+                        out.println(indent + "}");
+                    }
+
+                    out.println(nullAllowedIndent + indent + "if (" + offset +
+                            " < 0) {");
+                    out.println(nullAllowedIndent + indent + indent +
+                            "_exception = 1;");
+                    out.println(nullAllowedIndent + indent + indent +
+                            "_exceptionType = " +
+                            "\"java/lang/IllegalArgumentException\";");
+                    out.println(nullAllowedIndent + indent + indent +
+                            "_exceptionMessage = \"" + offset +" < 0\";");
+                    out.println(nullAllowedIndent + indent + indent +
+                            "goto exit;");
+                    out.println(nullAllowedIndent + indent + "}");
+
+                    out.println(nullAllowedIndent + indent + remaining + " = " +
+                            (mUseCPlusPlus ? "_env" : "(*_env)") +
+                            "->GetArrayLength(" +
+                            (mUseCPlusPlus ? "" : "_env, ") +
+                            cname + "_ref) - " + offset + ";");
 
                     emitNativeBoundsChecks(cfunc, cname, out, false,
-                                           emitExceptionCheck,
-                                           offset, remaining, "    ");
+                            emitExceptionCheck, offset, remaining,
+                            nullAllowedIndent + indent);
 
-                    out.println(indent +
+                    out.println(nullAllowedIndent + indent +
                                 cname +
                                 "_base = (" +
                                 cfunc.getArgType(cIndex).getDeclaration() +
                                 ")");
-                    out.println(indent + "    " +
+                    String arrayGetter = jfunc.getArgType(idx).getArrayGetterForPrimitiveArray();
+                    out.println(nullAllowedIndent + indent + "    " +
                                 (mUseCPlusPlus ? "_env" : "(*_env)") +
-                                "->GetPrimitiveArrayCritical(" +
+                                "->" + arrayGetter + "(" +
                                 (mUseCPlusPlus ? "" : "_env, ") +
                                 jfunc.getArgName(idx) +
                                 "_ref, (jboolean *)0);");
-                    out.println(indent +
+                    out.println(nullAllowedIndent + indent +
                                 cname + " = " + cname + "_base + " + offset + ";");
 
                     emitSentinelCheck(cfunc, cname, out, false,
-                                      emitExceptionCheck, offset,
-                                      remaining, indent);
+                            emitExceptionCheck, offset, remaining,
+                            nullAllowedIndent + indent);
+
+                    if (nullAllowed) {
+                        out.println(indent + "}");
+                    }
+
                     out.println();
                 } else if (jfunc.getArgType(idx).isArray()
                               && jfunc.getArgType(idx).isEGLHandle()) {
                     needsExit = true;
-                    out.println(indent + "if (!" + cname + "_ref) {");
-                    out.println(indent + indent + "_exception = 1;");
-                    out.println(indent + indent +
-                                "_exceptionType = \"java/lang/IllegalArgumentException\";");
-                    out.println(indent + indent + "_exceptionMessage = \"" + cname +" == null\";");
-                    out.println(indent + indent + "goto exit;");
-                    out.println(indent + "}");
-                    out.println(indent + "if (" + offset + " < 0) {");
-                    out.println(indent + indent + "_exception = 1;");
-                    out.println(indent + indent +
-                                "_exceptionType = \"java/lang/IllegalArgumentException\";");
-                    out.println(indent + indent + "_exceptionMessage = \"" + offset +" < 0\";");
-                    out.println(indent + indent + "goto exit;");
-                    out.println(indent + "}");
 
-                    out.println(indent + remaining + " = " +
+                    if (nullAllowed) {
+                        out.println(indent + "if (" + cname + "_ref) {");
+                    }
+                    else
+                    {
+                        out.println(indent + "if (!" + cname + "_ref) {");
+                        out.println(indent + indent + "_exception = 1;");
+                        out.println(indent + indent + "_exceptionType = " +
+                                "\"java/lang/IllegalArgumentException\";");
+                        out.println(indent + indent + "_exceptionMessage = \"" +
+                                cname +" == null\";");
+                        out.println(indent + indent + "goto exit;");
+                        out.println(indent + "}");
+                    }
+
+                    out.println(nullAllowedIndent + indent + "if (" + offset +
+                            " < 0) {");
+                    out.println(nullAllowedIndent + indent + indent +
+                            "_exception = 1;");
+                    out.println(nullAllowedIndent + indent + indent +
+                            "_exceptionType = " +
+                            "\"java/lang/IllegalArgumentException\";");
+                    out.println(nullAllowedIndent + indent + indent +
+                            "_exceptionMessage = \"" + offset +" < 0\";");
+                    out.println(nullAllowedIndent + indent + indent +
+                            "goto exit;");
+                    out.println(nullAllowedIndent + indent + "}");
+
+                    out.println(nullAllowedIndent + indent + remaining + " = " +
                                     (mUseCPlusPlus ? "_env" : "(*_env)") +
                                     "->GetArrayLength(" +
                                     (mUseCPlusPlus ? "" : "_env, ") +
                                     cname + "_ref) - " + offset + ";");
                     emitNativeBoundsChecks(cfunc, cname, out, false,
-                                           emitExceptionCheck,
-                                           offset, remaining, "    ");
-                    out.println(indent +
+                            emitExceptionCheck, offset, remaining,
+                            nullAllowedIndent + indent);
+                    out.println(nullAllowedIndent + indent +
                                 jfunc.getArgName(idx) + " = new " +
                                 cfunc.getArgType(cIndex).getBaseType() +
                                "["+ remaining + "];");
+
+                    if (nullAllowed) {
+                        out.println(indent + "}");
+                    }
+
                     out.println();
                 } else if (jfunc.getArgType(idx).isBuffer()) {
                     String array = numBufferArgs <= 1 ? "_array" :
@@ -1185,7 +1313,7 @@ public class JniCodeEmitter {
                     String bufferOffset = numBufferArgs <= 1 ? "_bufferOffset" :
                         "_" + cfunc.getArgName(cIndex) + "BufferOffset";
 
-                    boolean nullAllowed = isNullAllowed(cfunc) || isPointerFunc;
+                    nullAllowed = nullAllowed || isPointerFunc;
                     if (nullAllowed) {
                         out.println(indent + "if (" + cname + "_buf) {");
                         out.print(indent);
@@ -1209,7 +1337,7 @@ public class JniCodeEmitter {
                                     cfunc.getArgType(cIndex).getDeclaration() +
                                     ")getPointer(_env, " +
                                     cname +
-                                    "_buf, &" + array + ", &" + remaining + ", &" + bufferOffset +
+                                    "_buf, (jarray*)&" + array + ", &" + remaining + ", &" + bufferOffset +
                                     ");");
                     }
 
@@ -1238,15 +1366,24 @@ public class JniCodeEmitter {
                 String array = numBufferArgs <= 1 ? "_array" :
                             "_" + cfunc.getArgName(cIndex) + "Array";
 
-                boolean nullAllowed = isNullAllowed(cfunc) || isPointerFunc;
+                boolean nullAllowed = isNullAllowed(cfunc, cname) ||
+                        isPointerFunc;
                 if (nullAllowed) {
                     out.println(indent + "if (" + cname + "_buf && " + cname +" == NULL) {");
                 } else {
                     out.println(indent + "if (" + cname +" == NULL) {");
                 }
-                out.println(indent + indent + "char * _" + cname + "Base = (char *)_env->GetPrimitiveArrayCritical(" + array + ", (jboolean *) 0);");
-                out.println(indent + indent + cname + " = (" +cfunc.getArgType(cIndex).getDeclaration() +") (_" + cname + "Base + " + bufferOffset + ");");
-                out.println(indent + "}");
+                JType argType = jfunc.getArgType(idx);
+                if (argType.isTypedBuffer()) {
+                    String arrayGetter = argType.getArrayTypeForTypedBuffer().getArrayGetterForPrimitiveArray();
+                    out.println(indent + indent + "char * _" + cname + "Base = (char *)_env->" + arrayGetter + "(" + array + ", (jboolean *) 0);");
+                    out.println(indent + indent + cname + " = (" +cfunc.getArgType(cIndex).getDeclaration() +") (_" + cname + "Base + " + bufferOffset + ");");
+                    out.println(indent + "}");
+                } else {
+                    out.println(indent + indent + "char * _" + cname + "Base = (char *)_env->GetPrimitiveArrayCritical(" + array + ", (jboolean *) 0);");
+                    out.println(indent + indent + cname + " = (" +cfunc.getArgType(cIndex).getDeclaration() +") (_" + cname + "Base + " + bufferOffset + ");");
+                    out.println(indent + "}");
+                }
              }
         }
 
@@ -1336,12 +1473,13 @@ public class JniCodeEmitter {
                     // the need to write back to the Java array
                     out.println(indent +
                                 "if (" + jfunc.getArgName(idx) + "_base) {");
+                    String arrayReleaser = jfunc.getArgType(idx).getArrayReleaserForPrimitiveArray();
                     out.println(indent + indent +
                                 (mUseCPlusPlus ? "_env" : "(*_env)") +
-                                "->ReleasePrimitiveArrayCritical(" +
+                                "->" + arrayReleaser + "(" +
                                 (mUseCPlusPlus ? "" : "_env, ") +
                                 jfunc.getArgName(idx) + "_ref, " +
-                                cfunc.getArgName(cIndex) +
+                                "(j" + jfunc.getArgType(idx).getBaseType() + "*)" + cfunc.getArgName(cIndex) +
                                 "_base,");
                     out.println(indent + indent + indent +
                                 (cfunc.getArgType(cIndex).isConst() ?
@@ -1350,17 +1488,32 @@ public class JniCodeEmitter {
                     out.println(indent + "}");
                 } else if (jfunc.getArgType(idx).isBuffer()) {
                     if (! isPointerFunc) {
+                        JType argType = jfunc.getArgType(idx);
                         String array = numBufferArgs <= 1 ? "_array" :
                             "_" + cfunc.getArgName(cIndex) + "Array";
                         out.println(indent + "if (" + array + ") {");
-                        out.println(indent + indent +
-                                    "releasePointer(_env, " + array + ", " +
-                                    cfunc.getArgName(cIndex) +
-                                    ", " +
-                                    (cfunc.getArgType(cIndex).isConst() ?
-                                     "JNI_FALSE" : (emitExceptionCheck ?
-                                     "_exception ? JNI_FALSE : JNI_TRUE" : "JNI_TRUE")) +
-                                    ");");
+                        if (argType.isTypedBuffer()) {
+                            String arrayReleaser =
+                                argType.getArrayTypeForTypedBuffer().getArrayReleaserForPrimitiveArray();
+                            out.println(indent + indent +
+                                "_env->" + arrayReleaser + "(" + array + ", " +
+                                "(j" + argType.getArrayTypeForTypedBuffer().getBaseType() + "*)" +
+                                cfunc.getArgName(cIndex) +
+                                ", " +
+                                (cfunc.getArgType(cIndex).isConst() ?
+                                    "JNI_ABORT" : (emitExceptionCheck ?
+                                        "_exception ? JNI_ABORT : 0" : "0")) +
+                                ");");
+                        } else {
+                            out.println(indent + indent +
+                                "releasePointer(_env, " + array + ", " +
+                                cfunc.getArgName(cIndex) +
+                                ", " +
+                                (cfunc.getArgType(cIndex).isConst() ?
+                                    "JNI_FALSE" : (emitExceptionCheck ?
+                                        "_exception ? JNI_FALSE : JNI_TRUE" : "JNI_TRUE")) +
+                                ");");
+                        }
                         out.println(indent + "}");
                     }
                 }

@@ -52,9 +52,19 @@ public:
         TYPE_PROXIMITY      = ASENSOR_TYPE_PROXIMITY
     };
 
-            Sensor();
-            Sensor(struct sensor_t const* hwSensor, int halVersion = 0);
-            ~Sensor();
+    struct uuid_t{
+        union {
+            uint8_t b[16];
+            int64_t i64[2];
+        };
+        uuid_t(const uint8_t (&uuid)[16]) { memcpy(b, uuid, sizeof(b));}
+        uuid_t() : b{0} {}
+    };
+
+    Sensor(const char * name = "");
+    Sensor(struct sensor_t const* hwSensor, int halVersion = 0);
+    Sensor(struct sensor_t const& hwSensor, const uuid_t& uuid, int halVersion = 0);
+    ~Sensor();
 
     const String8& getName() const;
     const String8& getVendor() const;
@@ -67,14 +77,26 @@ public:
     int32_t getMinDelay() const;
     nsecs_t getMinDelayNs() const;
     int32_t getVersion() const;
-    int32_t getFifoReservedEventCount() const;
-    int32_t getFifoMaxEventCount() const;
+    uint32_t getFifoReservedEventCount() const;
+    uint32_t getFifoMaxEventCount() const;
     const String8& getStringType() const;
     const String8& getRequiredPermission() const;
+    bool isRequiredPermissionRuntime() const;
+    int32_t getRequiredAppOp() const;
     int32_t getMaxDelay() const;
-    int32_t getFlags() const;
+    uint32_t getFlags() const;
     bool isWakeUpSensor() const;
+    bool isDynamicSensor() const;
+    bool hasAdditionalInfo() const;
     int32_t getReportingMode() const;
+
+    // Note that after setId() has been called, getUuid() no longer
+    // returns the UUID.
+    // TODO(b/29547335): Remove getUuid(), add getUuidIndex(), and
+    //     make sure setId() doesn't change the UuidIndex.
+    const uuid_t& getUuid() const;
+    int32_t getId() const;
+    void setId(int32_t id);
 
     // LightFlattenable protocol
     inline bool isFixedSize() const { return false; }
@@ -93,12 +115,18 @@ private:
     float   mPower;
     int32_t mMinDelay;
     int32_t mVersion;
-    int32_t mFifoReservedEventCount;
-    int32_t mFifoMaxEventCount;
+    uint32_t mFifoReservedEventCount;
+    uint32_t mFifoMaxEventCount;
     String8 mStringType;
     String8 mRequiredPermission;
+    bool mRequiredPermissionRuntime = false;
+    int32_t mRequiredAppOp;
     int32_t mMaxDelay;
-    int32_t mFlags;
+    uint32_t mFlags;
+    // TODO(b/29547335): Get rid of this field and replace with an index.
+    //     The index will be into a separate global vector of UUIDs.
+    //     Also add an mId field (and change flatten/unflatten appropriately).
+    uuid_t  mUuid;
     static void flattenString8(void*& buffer, size_t& size, const String8& string8);
     static bool unflattenString8(void const*& buffer, size_t& size, String8& outputString8);
 };

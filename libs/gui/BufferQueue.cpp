@@ -32,10 +32,18 @@ BufferQueue::ProxyConsumerListener::ProxyConsumerListener(
 BufferQueue::ProxyConsumerListener::~ProxyConsumerListener() {}
 
 void BufferQueue::ProxyConsumerListener::onFrameAvailable(
-        const android::BufferItem& item) {
+        const BufferItem& item) {
     sp<ConsumerListener> listener(mConsumerListener.promote());
     if (listener != NULL) {
         listener->onFrameAvailable(item);
+    }
+}
+
+void BufferQueue::ProxyConsumerListener::onFrameReplaced(
+        const BufferItem& item) {
+    sp<ConsumerListener> listener(mConsumerListener.promote());
+    if (listener != NULL) {
+        listener->onFrameReplaced(item);
     }
 }
 
@@ -51,6 +59,15 @@ void BufferQueue::ProxyConsumerListener::onSidebandStreamChanged() {
     if (listener != NULL) {
         listener->onSidebandStreamChanged();
     }
+}
+
+bool BufferQueue::ProxyConsumerListener::getFrameTimestamps(
+        uint64_t frameNumber, FrameTimestamps* outTimestamps) const {
+    sp<ConsumerListener> listener(mConsumerListener.promote());
+    if (listener != NULL) {
+        return listener->getFrameTimestamps(frameNumber, outTimestamps);
+    }
+    return false;
 }
 
 void BufferQueue::createBufferQueue(sp<IGraphicBufferProducer>* outProducer,

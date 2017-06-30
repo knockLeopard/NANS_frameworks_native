@@ -27,6 +27,7 @@ commonSources := \
 
 deviceSources := \
     $(commonSources) \
+    IInputFlinger.cpp \
     InputTransport.cpp \
     VelocityControl.cpp \
     VelocityTracker.cpp
@@ -54,6 +55,9 @@ include $(BUILD_HOST_STATIC_LIBRARY)
 include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES:= $(deviceSources)
+
+LOCAL_CLANG := true
+LOCAL_SANITIZE := integer
 
 LOCAL_SHARED_LIBRARIES := \
 	liblog \

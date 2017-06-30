@@ -43,10 +43,7 @@ Client::~Client()
 {
     const size_t count = mLayers.size();
     for (size_t i=0 ; i<count ; i++) {
-        sp<Layer> layer(mLayers.valueAt(i).promote());
-        if (layer != 0) {
-            mFlinger->removeLayer(layer);
-        }
+        mFlinger->removeLayer(mLayers.valueAt(i));
     }
 }
 
@@ -93,7 +90,7 @@ status_t Client::onTransact(
      const int pid = ipc->getCallingPid();
      const int uid = ipc->getCallingUid();
      const int self_pid = getpid();
-     if (CC_UNLIKELY(pid != self_pid && uid != AID_GRAPHICS && uid != 0)) {
+     if (CC_UNLIKELY(pid != self_pid && uid != AID_GRAPHICS && uid != AID_SYSTEM && uid != 0)) {
          // we're called from a different process, do the real check
          if (!PermissionCache::checkCallingPermission(sAccessSurfaceFlinger))
          {
@@ -134,7 +131,7 @@ status_t Client::createSurface(
                 sp<IBinder>* handle,
                 sp<IGraphicBufferProducer>* gbp)
             : flinger(flinger), client(client),
-              handle(handle), gbp(gbp),
+              handle(handle), gbp(gbp), result(NO_ERROR),
               name(name), w(w), h(h), format(format), flags(flags) {
         }
         status_t getResult() const { return result; }
@@ -170,6 +167,16 @@ status_t Client::getLayerFrameStats(const sp<IBinder>& handle, FrameStats* outSt
         return NAME_NOT_FOUND;
     }
     layer->getFrameStats(outStats);
+    return NO_ERROR;
+}
+
+status_t Client::getTransformToDisplayInverse(const sp<IBinder>& handle,
+        bool* outTransformToDisplayInverse) const {
+    sp<Layer> layer = getLayerUser(handle);
+    if (layer == NULL) {
+        return NAME_NOT_FOUND;
+    }
+    *outTransformToDisplayInverse = layer->getTransformToDisplayInverse();
     return NO_ERROR;
 }
 

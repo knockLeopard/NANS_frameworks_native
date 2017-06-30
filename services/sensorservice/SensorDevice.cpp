@@ -39,8 +39,7 @@ ANDROID_SINGLETON_STATIC_INSTANCE(SensorDevice)
 
 SensorDevice::SensorDevice()
     :  mSensorDevice(0),
-       mSensorModule(0)
-{
+       mSensorModule(0) {
     status_t err = hw_get_module(SENSORS_HARDWARE_MODULE_ID,
             (hw_module_t const**)&mSensorModule);
 
@@ -73,36 +72,54 @@ SensorDevice::SensorDevice()
     }
 }
 
-void SensorDevice::dump(String8& result)
-{
-    if (!mSensorModule) return;
-    sensor_t const* list;
-    ssize_t count = mSensorModule->get_sensors_list(mSensorModule, &list);
+void SensorDevice::handleDynamicSensorConnection(int handle, bool connected) {
+    if (connected) {
+        Info model;
+        mActivationCount.add(handle, model);
+        mSensorDevice->activate(
+                reinterpret_cast<struct sensors_poll_device_t *>(mSensorDevice), handle, 0);
+    } else {
+        mActivationCount.removeItem(handle);
+    }
+}
 
-    result.appendFormat("halVersion %d\n", getHalDeviceVersion());
-    result.appendFormat("%d h/w sensors:\n", int(count));
+std::string SensorDevice::dump() const {
+    if (!mSensorModule) return "HAL not initialized\n";
+
+    String8 result;
+    sensor_t const* list;
+    int count = mSensorModule->get_sensors_list(mSensorModule, &list);
+
+    result.appendFormat("HAL: %s (%s), version %#010x\n",
+                        mSensorModule->common.name,
+                        mSensorModule->common.author,
+                        getHalDeviceVersion());
+    result.appendFormat("Total %d h/w sensors, %zu running:\n", count, mActivationCount.size());
 
     Mutex::Autolock _l(mLock);
-    for (size_t i=0 ; i<size_t(count) ; i++) {
+    for (int i = 0 ; i < count ; i++) {
         const Info& info = mActivationCount.valueFor(list[i].handle);
-        result.appendFormat("handle=0x%08x, active-count=%zu, batch_period(ms)={ ", list[i].handle,
+        if (info.batchParams.isEmpty()) continue;
+        result.appendFormat("0x%08x) active-count = %zu; ", list[i].handle,
                             info.batchParams.size());
-        for (size_t j = 0; j < info.batchParams.size(); j++) {
-            BatchParams params = info.batchParams.valueAt(j);
-            result.appendFormat("%4.1f%s", params.batchDelay / 1e6f,
-                                j < info.batchParams.size() - 1 ? ", " : "");
-        }
-        result.appendFormat(" }, selected=%4.1f ms\n", info.bestBatchParams.batchDelay / 1e6f);
 
-        result.appendFormat("handle=0x%08x, active-count=%zu, batch_timeout(ms)={ ", list[i].handle,
-                            info.batchParams.size());
+        result.append("sampling_period(ms) = {");
         for (size_t j = 0; j < info.batchParams.size(); j++) {
-            BatchParams params = info.batchParams.valueAt(j);
-            result.appendFormat("%4.1f%s", params.batchTimeout / 1e6f,
+            const BatchParams& params = info.batchParams.valueAt(j);
+            result.appendFormat("%.1f%s", params.batchDelay / 1e6f,
                                 j < info.batchParams.size() - 1 ? ", " : "");
         }
-        result.appendFormat(" }, selected=%4.1f ms\n", info.bestBatchParams.batchTimeout / 1e6f);
+        result.appendFormat("}, selected = %.1f ms; ", info.bestBatchParams.batchDelay / 1e6f);
+
+        result.append("batching_period(ms) = {");
+        for (size_t j = 0; j < info.batchParams.size(); j++) {
+            BatchParams params = info.batchParams.valueAt(j);
+            result.appendFormat("%.1f%s", params.batchTimeout / 1e6f,
+                                j < info.batchParams.size() - 1 ? ", " : "");
+        }
+        result.appendFormat("}, selected = %.1f ms\n", info.bestBatchParams.batchTimeout / 1e6f);
     }
+    return result.string();
 }
 
 ssize_t SensorDevice::getSensorList(sensor_t const** list) {
@@ -131,8 +148,7 @@ void SensorDevice::autoDisable(void *ident, int handle) {
     info.removeBatchParamsForIdent(ident);
 }
 
-status_t SensorDevice::activate(void* ident, int handle, int enabled)
-{
+status_t SensorDevice::activate(void* ident, int handle, int enabled) {
     if (!mSensorDevice) return NO_INIT;
     status_t err(NO_ERROR);
     bool actuateHardware = false;
@@ -147,8 +163,12 @@ status_t SensorDevice::activate(void* ident, int handle, int enabled)
     if (enabled) {
         ALOGD_IF(DEBUG_CONNECTIONS, "enable index=%zd", info.batchParams.indexOfKey(ident));
 
+        if (isClientDisabledLocked(ident)) {
+            return INVALID_OPERATION;
+        }
+
         if (info.batchParams.indexOfKey(ident) >= 0) {
-          if (info.batchParams.size() == 1) {
+          if (info.numActiveClients() == 1) {
               // This is the first connection, we need to activate the underlying h/w sensor.
               actuateHardware = true;
           }
@@ -160,7 +180,7 @@ status_t SensorDevice::activate(void* ident, int handle, int enabled)
         ALOGD_IF(DEBUG_CONNECTIONS, "disable index=%zd", info.batchParams.indexOfKey(ident));
 
         if (info.removeBatchParamsForIdent(ident) >= 0) {
-            if (info.batchParams.size() == 0) {
+            if (info.numActiveClients() == 0) {
                 // This is the last connection, we need to de-activate the underlying h/w sensor.
                 actuateHardware = true;
             } else {
@@ -181,10 +201,15 @@ status_t SensorDevice::activate(void* ident, int handle, int enabled)
         } else {
             // sensor wasn't enabled for this ident
         }
+
+        if (isClientDisabledLocked(ident)) {
+            return NO_ERROR;
+        }
     }
 
     if (actuateHardware) {
-        ALOGD_IF(DEBUG_CONNECTIONS, "\t>>> actuating h/w activate handle=%d enabled=%d", handle, enabled);
+        ALOGD_IF(DEBUG_CONNECTIONS, "\t>>> actuating h/w activate handle=%d enabled=%d", handle,
+                 enabled);
         err = mSensorDevice->activate(
                 reinterpret_cast<struct sensors_poll_device_t *> (mSensorDevice), handle, enabled);
         ALOGE_IF(err, "Error %s sensor %d (%s)", enabled ? "activating" : "disabling", handle,
@@ -197,7 +222,7 @@ status_t SensorDevice::activate(void* ident, int handle, int enabled)
     }
 
     // On older devices which do not support batch, call setDelay().
-    if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_1 && info.batchParams.size() > 0) {
+    if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_1 && info.numActiveClients() > 0) {
         ALOGD_IF(DEBUG_CONNECTIONS, "\t>>> actuating h/w setDelay %d %" PRId64, handle,
                  info.bestBatchParams.batchDelay);
         mSensorDevice->setDelay(
@@ -272,13 +297,13 @@ status_t SensorDevice::batch(void* ident, int handle, int flags, int64_t samplin
     return err;
 }
 
-status_t SensorDevice::setDelay(void* ident, int handle, int64_t samplingPeriodNs)
-{
+status_t SensorDevice::setDelay(void* ident, int handle, int64_t samplingPeriodNs) {
     if (!mSensorDevice) return NO_INIT;
     if (samplingPeriodNs < MINIMUM_EVENTS_PERIOD) {
         samplingPeriodNs = MINIMUM_EVENTS_PERIOD;
     }
     Mutex::Autolock _l(mLock);
+    if (isClientDisabledLocked(ident)) return INVALID_OPERATION;
     Info& info( mActivationCount.editValueFor(handle) );
     // If the underlying sensor is NOT in continuous mode, setDelay() should return an error.
     // Calling setDelay() in batch mode is an invalid operation.
@@ -298,7 +323,6 @@ status_t SensorDevice::setDelay(void* ident, int handle, int64_t samplingPeriodN
 
 int SensorDevice::getHalDeviceVersion() const {
     if (!mSensorDevice) return -1;
-
     return mSensorDevice->common.version;
 }
 
@@ -306,11 +330,109 @@ status_t SensorDevice::flush(void* ident, int handle) {
     if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_1) {
         return INVALID_OPERATION;
     }
+    if (isClientDisabled(ident)) return INVALID_OPERATION;
     ALOGD_IF(DEBUG_CONNECTIONS, "\t>>> actuating h/w flush %d", handle);
     return mSensorDevice->flush(mSensorDevice, handle);
 }
 
+bool SensorDevice::isClientDisabled(void* ident) {
+    Mutex::Autolock _l(mLock);
+    return isClientDisabledLocked(ident);
+}
+
+bool SensorDevice::isClientDisabledLocked(void* ident) {
+    return mDisabledClients.indexOf(ident) >= 0;
+}
+
+void SensorDevice::enableAllSensors() {
+    Mutex::Autolock _l(mLock);
+    mDisabledClients.clear();
+    const int halVersion = getHalDeviceVersion();
+    for (size_t i = 0; i< mActivationCount.size(); ++i) {
+        Info& info = mActivationCount.editValueAt(i);
+        if (info.batchParams.isEmpty()) continue;
+        info.selectBatchParams();
+        const int sensor_handle = mActivationCount.keyAt(i);
+        ALOGD_IF(DEBUG_CONNECTIONS, "\t>> reenable actuating h/w sensor enable handle=%d ",
+                   sensor_handle);
+        status_t err(NO_ERROR);
+        if (halVersion > SENSORS_DEVICE_API_VERSION_1_0) {
+            err = mSensorDevice->batch(mSensorDevice, sensor_handle,
+                 info.bestBatchParams.flags, info.bestBatchParams.batchDelay,
+                 info.bestBatchParams.batchTimeout);
+            ALOGE_IF(err, "Error calling batch on sensor %d (%s)", sensor_handle, strerror(-err));
+        }
+
+        if (err == NO_ERROR) {
+            err = mSensorDevice->activate(
+                    reinterpret_cast<struct sensors_poll_device_t *>(mSensorDevice),
+                    sensor_handle, 1);
+            ALOGE_IF(err, "Error activating sensor %d (%s)", sensor_handle, strerror(-err));
+        }
+
+        if (halVersion <= SENSORS_DEVICE_API_VERSION_1_0) {
+             err = mSensorDevice->setDelay(
+                    reinterpret_cast<struct sensors_poll_device_t *>(mSensorDevice),
+                    sensor_handle, info.bestBatchParams.batchDelay);
+             ALOGE_IF(err, "Error calling setDelay sensor %d (%s)", sensor_handle, strerror(-err));
+        }
+    }
+}
+
+void SensorDevice::disableAllSensors() {
+    Mutex::Autolock _l(mLock);
+   for (size_t i = 0; i< mActivationCount.size(); ++i) {
+        const Info& info = mActivationCount.valueAt(i);
+        // Check if this sensor has been activated previously and disable it.
+        if (info.batchParams.size() > 0) {
+           const int sensor_handle = mActivationCount.keyAt(i);
+           ALOGD_IF(DEBUG_CONNECTIONS, "\t>> actuating h/w sensor disable handle=%d ",
+                   sensor_handle);
+           mSensorDevice->activate(
+                   reinterpret_cast<struct sensors_poll_device_t *> (mSensorDevice),
+                   sensor_handle, 0);
+           // Add all the connections that were registered for this sensor to the disabled
+           // clients list.
+           for (size_t j = 0; j < info.batchParams.size(); ++j) {
+               mDisabledClients.add(info.batchParams.keyAt(j));
+           }
+        }
+    }
+}
+
+status_t SensorDevice::injectSensorData(const sensors_event_t *injected_sensor_event) {
+      ALOGD_IF(DEBUG_CONNECTIONS,
+              "sensor_event handle=%d ts=%" PRId64 " data=%.2f, %.2f, %.2f %.2f %.2f %.2f",
+               injected_sensor_event->sensor,
+               injected_sensor_event->timestamp, injected_sensor_event->data[0],
+               injected_sensor_event->data[1], injected_sensor_event->data[2],
+               injected_sensor_event->data[3], injected_sensor_event->data[4],
+               injected_sensor_event->data[5]);
+      if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_4) {
+          return INVALID_OPERATION;
+      }
+      return mSensorDevice->inject_sensor_data(mSensorDevice, injected_sensor_event);
+}
+
+status_t SensorDevice::setMode(uint32_t mode) {
+     if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_4) {
+          return INVALID_OPERATION;
+     }
+     return mSensorModule->set_operation_mode(mode);
+}
+
 // ---------------------------------------------------------------------------
+
+int SensorDevice::Info::numActiveClients() {
+    SensorDevice& device(SensorDevice::getInstance());
+    int num = 0;
+    for (size_t i = 0; i < batchParams.size(); ++i) {
+        if (!device.isClientDisabledLocked(batchParams.keyAt(i))) {
+            ++num;
+        }
+    }
+    return num;
+}
 
 status_t SensorDevice::Info::setBatchParamsForIdent(void* ident, int flags,
                                                     int64_t samplingPeriodNs,
@@ -329,19 +451,16 @@ status_t SensorDevice::Info::setBatchParamsForIdent(void* ident, int flags,
 }
 
 void SensorDevice::Info::selectBatchParams() {
-    BatchParams bestParams(-1, -1, -1);
+    BatchParams bestParams(0, -1, -1);
+    SensorDevice& device(SensorDevice::getInstance());
 
-    if (batchParams.size() > 0) {
-        BatchParams params = batchParams.valueAt(0);
-        bestParams = params;
-    }
-
-    for (size_t i = 1; i < batchParams.size(); ++i) {
+    for (size_t i = 0; i < batchParams.size(); ++i) {
+        if (device.isClientDisabledLocked(batchParams.keyAt(i))) continue;
         BatchParams params = batchParams.valueAt(i);
-        if (params.batchDelay < bestParams.batchDelay) {
+        if (bestParams.batchDelay == -1 || params.batchDelay < bestParams.batchDelay) {
             bestParams.batchDelay = params.batchDelay;
         }
-        if (params.batchTimeout < bestParams.batchTimeout) {
+        if (bestParams.batchTimeout == -1 || params.batchTimeout < bestParams.batchTimeout) {
             bestParams.batchTimeout = params.batchTimeout;
         }
     }
@@ -354,6 +473,11 @@ ssize_t SensorDevice::Info::removeBatchParamsForIdent(void* ident) {
         selectBatchParams();
     }
     return idx;
+}
+
+void SensorDevice::notifyConnectionDestroyed(void* ident) {
+    Mutex::Autolock _l(mLock);
+    mDisabledClients.remove(ident);
 }
 
 // ---------------------------------------------------------------------------

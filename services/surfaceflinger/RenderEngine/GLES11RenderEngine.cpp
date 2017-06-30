@@ -43,12 +43,6 @@ GLES11RenderEngine::GLES11RenderEngine() {
     glDisable(GL_DITHER);
     glDisable(GL_CULL_FACE);
 
-    struct pack565 {
-        inline uint16_t operator() (int r, int g, int b) const {
-            return (r<<11)|(g<<5)|b;
-        }
-    } pack565;
-
     const uint16_t protTexData[] = { 0 };
     glGenTextures(1, &mProtectedTexName);
     glBindTexture(GL_TEXTURE_2D, mProtectedTexName);
@@ -113,20 +107,33 @@ void GLES11RenderEngine::setViewportAndProjection(
     glMatrixMode(GL_MODELVIEW);
 }
 
+#ifdef USE_HWC2
+void GLES11RenderEngine::setupLayerBlending(bool premultipliedAlpha,
+        bool opaque, float alpha) {
+#else
 void GLES11RenderEngine::setupLayerBlending(
     bool premultipliedAlpha, bool opaque, int alpha) {
+#endif
     GLenum combineRGB;
     GLenum combineAlpha;
     GLenum src0Alpha;
     GLfloat envColor[4];
 
+#ifdef USE_HWC2
+    if (CC_UNLIKELY(alpha < 1.0f)) {
+#else
     if (CC_UNLIKELY(alpha < 0xFF)) {
+#endif
         // Cv = premultiplied ? Cs*alpha : Cs
         // Av = !opaque       ? As*alpha : As
         combineRGB   = premultipliedAlpha ? GL_MODULATE : GL_REPLACE;
         combineAlpha = !opaque            ? GL_MODULATE : GL_REPLACE;
         src0Alpha    = GL_CONSTANT;
+#ifdef USE_HWC2
+        envColor[0]  = alpha;
+#else
         envColor[0]  = alpha * (1.0f / 255.0f);
+#endif
     } else {
         // Cv = Cs
         // Av = opaque ? 1.0 : As
@@ -158,7 +165,11 @@ void GLES11RenderEngine::setupLayerBlending(
         glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, envColor);
     }
 
+#ifdef USE_HWC2
+    if (alpha < 1.0f || !opaque) {
+#else
     if (alpha < 0xFF || !opaque) {
+#endif
         glEnable(GL_BLEND);
         glBlendFunc(premultipliedAlpha ? GL_ONE : GL_SRC_ALPHA,
                     GL_ONE_MINUS_SRC_ALPHA);
@@ -167,16 +178,28 @@ void GLES11RenderEngine::setupLayerBlending(
     }
 }
 
+#ifdef USE_HWC2
+void GLES11RenderEngine::setupDimLayerBlending(float alpha) {
+#else
 void GLES11RenderEngine::setupDimLayerBlending(int alpha) {
+#endif
     glDisable(GL_TEXTURE_EXTERNAL_OES);
     glDisable(GL_TEXTURE_2D);
+#ifdef USE_HWC2
+    if (alpha == 1.0f) {
+#else
     if (alpha == 0xFF) {
+#endif
         glDisable(GL_BLEND);
     } else {
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     }
+#ifdef USE_HWC2
+    glColor4f(0, 0, 0, alpha);
+#else
     glColor4f(0, 0, 0, alpha/255.0f);
+#endif
 }
 
 void GLES11RenderEngine::setupLayerTexturing(const Texture& texture) {
@@ -266,14 +289,6 @@ void GLES11RenderEngine::drawMesh(const Mesh& mesh) {
     if (mesh.getTexCoordsSize()) {
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     }
-}
-
-void GLES11RenderEngine::beginGroup(const mat4& /*colorTransform*/) {
-    // doesn't do anything in GLES 1.1
-}
-
-void GLES11RenderEngine::endGroup() {
-    // doesn't do anything in GLES 1.1
 }
 
 void GLES11RenderEngine::dump(String8& result) {

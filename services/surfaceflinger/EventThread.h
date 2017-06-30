@@ -51,6 +51,7 @@ public:
     virtual ~VSyncSource() {}
     virtual void setVSyncEnabled(bool enable) = 0;
     virtual void setCallback(const sp<Callback>& callback) = 0;
+    virtual void setPhaseOffset(nsecs_t phaseOffset) = 0;
 };
 
 class EventThread : public Thread, private VSyncSource::Callback {
@@ -76,7 +77,7 @@ class EventThread : public Thread, private VSyncSource::Callback {
 
 public:
 
-    EventThread(const sp<VSyncSource>& src);
+    EventThread(const sp<VSyncSource>& src, SurfaceFlinger& flinger);
 
     sp<Connection> createEventConnection() const;
     status_t registerDisplayEventConnection(const sp<Connection>& connection);
@@ -99,6 +100,8 @@ public:
     void dump(String8& result) const;
     void sendVsyncHintOff();
 
+    void setPhaseOffset(nsecs_t phaseOffset);
+
 private:
     virtual bool        threadLoop();
     virtual void        onFirstRef();
@@ -113,6 +116,7 @@ private:
     // constants
     sp<VSyncSource> mVSyncSource;
     PowerHAL mPowerHAL;
+    SurfaceFlinger& mFlinger;
 
     mutable Mutex mLock;
     mutable Condition mCondition;
